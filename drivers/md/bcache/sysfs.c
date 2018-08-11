@@ -352,7 +352,7 @@ STORE(__cached_dev)
 		if (v < 0)
 			return v;
 
-		if ((unsigned) v != BDEV_CACHE_MODE(&dc->sb)) {
+		if ((unsigned int) v != BDEV_CACHE_MODE(&dc->sb)) {
 			SET_BDEV_CACHE_MODE(&dc->sb, v);
 			bch_write_bdev_super(dc, NULL);
 		}
@@ -594,9 +594,9 @@ static int bch_bset_print_stats(struct cache_set *c, char *buf)
 			op.stats.floats, op.stats.failed);
 }
 
-static unsigned bch_root_usage(struct cache_set *c)
+static unsigned int bch_root_usage(struct cache_set *c)
 {
-	unsigned bytes = 0;
+	unsigned int bytes = 0;
 	struct bkey *k;
 	struct btree *b;
 	struct btree_iter iter;
@@ -631,9 +631,9 @@ static size_t bch_cache_size(struct cache_set *c)
 	return ret;
 }
 
-static unsigned bch_cache_max_chain(struct cache_set *c)
+static unsigned int bch_cache_max_chain(struct cache_set *c)
 {
-	unsigned ret = 0;
+	unsigned int ret = 0;
 	struct hlist_head *h;
 
 	mutex_lock(&c->bucket_lock);
@@ -641,7 +641,7 @@ static unsigned bch_cache_max_chain(struct cache_set *c)
 	for (h = c->bucket_hash;
 	     h < c->bucket_hash + (1 << BUCKET_HASH_BITS);
 	     h++) {
-		unsigned i = 0;
+		unsigned int i = 0;
 		struct hlist_node *p;
 
 		hlist_for_each(p, h)
@@ -654,13 +654,13 @@ static unsigned bch_cache_max_chain(struct cache_set *c)
 	return ret;
 }
 
-static unsigned bch_btree_used(struct cache_set *c)
+static unsigned int bch_btree_used(struct cache_set *c)
 {
 	return div64_u64(c->gc_stats.key_bytes * 100,
 			 (c->gc_stats.nodes ?: 1) * btree_bytes(c));
 }
 
-static unsigned bch_average_key_size(struct cache_set *c)
+static unsigned int bch_average_key_size(struct cache_set *c)
 {
 	return c->gc_stats.nkeys
 		? div64_u64(c->gc_stats.data, c->gc_stats.nkeys)
@@ -1059,7 +1059,7 @@ STORE(__bch_cache)
 		if (v < 0)
 			return v;
 
-		if ((unsigned) v != CACHE_REPLACEMENT(&ca->sb)) {
+		if ((unsigned int) v != CACHE_REPLACEMENT(&ca->sb)) {
 			mutex_lock(&ca->set->bucket_lock);
 			SET_CACHE_REPLACEMENT(&ca->sb, v);
 			mutex_unlock(&ca->set->bucket_lock);
