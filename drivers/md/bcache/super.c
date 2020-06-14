@@ -32,6 +32,7 @@
 #include <linux/genhd.h>
 #include <linux/idr.h>
 #include <linux/kthread.h>
+#include <linux/workqueue.h>
 #include <linux/module.h>
 #include <linux/random.h>
 #include <linux/reboot.h>
@@ -2326,7 +2327,7 @@ static bool bch_is_open(struct block_device *bdev)
 }
 
 struct async_reg_args {
-	struct work_struct reg_work;
+	struct delayed_work reg_work;
 	char *path;
 	struct cache_sb *sb;
 	struct cache_sb_disk *sb_disk;
@@ -2337,7 +2338,7 @@ static void register_bdev_worker(struct work_struct *work)
 {
 	int fail = false;
 	struct async_reg_args *args =
-		container_of(work, struct async_reg_args, reg_work);
+		container_of(work, struct async_reg_args, reg_work.work);
 	struct cached_dev *dc;
 
 	dc = kzalloc(sizeof(*dc), GFP_KERNEL);
@@ -2367,7 +2368,7 @@ static void register_cache_worker(struct work_struct *work)
 {
 	int fail = false;
 	struct async_reg_args *args =
-		container_of(work, struct async_reg_args, reg_work);
+		container_of(work, struct async_reg_args, reg_work.work);
 	struct cache *ca;
 
 	ca = kzalloc(sizeof(*ca), GFP_KERNEL);
@@ -2395,11 +2396,12 @@ out:
 static void register_device_aync(struct async_reg_args *args)
 {
 	if (SB_IS_BDEV(args->sb))
-		INIT_WORK(&args->reg_work, register_bdev_worker);
+		INIT_DELAYED_WORK(&args->reg_work, register_bdev_worker);
 	else
-		INIT_WORK(&args->reg_work, register_cache_worker);
+		INIT_DELAYED_WORK(&args->reg_work, register_cache_worker);
 
-	queue_work(system_wq, &args->reg_work);
+	/* 10 jiffies is enough for a delay */
+	queue_delayed_work(system_wq, &args->reg_work, 10);
 }
 
 static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
