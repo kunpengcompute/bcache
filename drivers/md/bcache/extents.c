@@ -325,12 +325,18 @@ static bool bch_extent_insert_fixup(struct btree_keys *b,
 				    struct bkey *replace_key)
 {
 	struct cache_set *c = container_of(b, struct btree, keys)->c;
+	struct cached_dev *dc;
 
 	uint64_t old_offset;
 	unsigned old_size, sectors_found = 0;
+	bool overlap = false;
+	bool insert_without_placeholder = true;
 
 	BUG_ON(!KEY_OFFSET(insert));
 	BUG_ON(!KEY_SIZE(insert));
+
+	list_for_each_entry(dc, &c->cached_devs, list)
+		insert_without_placeholder &= dc->insert_without_placeholder;
 
 	while (1) {
 		struct bkey *k = bch_btree_iter_next(iter);
@@ -338,14 +344,22 @@ static bool bch_extent_insert_fixup(struct btree_keys *b,
 			break;
 
 		if (bkey_cmp(&START_KEY(k), insert) >= 0) {
-			if (KEY_SIZE(k))
-				break;
-			else
+			if (!KEY_SIZE(k))
 				continue;
+			/*
+			 * Placeholding extents overlaping with inserting bkey may be droped
+			 * during btree mergesort. So we can insert bkey safely with write lock held
+			 * and without overlaps with existing extents.
+			 */
+			if (insert_without_placeholder && replace_key && !overlap) {
+				goto out;
+			}
+			break;
 		}
 
 		if (bkey_cmp(k, &START_KEY(insert)) <= 0)
 			continue;
+		overlap = true;
 
 		old_offset = KEY_START(k);
 		old_size = KEY_SIZE(k);
