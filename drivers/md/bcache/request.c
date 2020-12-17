@@ -8,11 +8,13 @@
  */
 
 #include "bcache.h"
+#include "interface.h"
 #include "btree.h"
 #include "debug.h"
 #include "request.h"
 #include "writeback.h"
 
+#include <linux/time.h>
 #include <linux/module.h>
 #include <linux/hash.h>
 #include <linux/random.h>
@@ -315,9 +317,17 @@ err:
 void bch_data_insert(struct closure *cl)
 {
 	struct data_insert_op *op = container_of(cl, struct data_insert_op, cl);
+	struct sample smp;
 
 	trace_bcache_write(op->c, op->inode, op->bio,
 			   op->writeback, op->bypass);
+
+	smp.offset = op->bio->bi_iter.bi_sector;
+	smp.length = op->bio->bi_iter.bi_size;
+	smp.opcode = ACACHE_SAMPLE_CACHE_INSERT;
+	smp.dev = bio_dev(op->bio);
+	smp.start_time = ktime_get_ns();
+	save_circ_item(sample_circ, &smp);
 
 	bch_keylist_init(&op->insert_keys);
 	bio_get(op->bio);
@@ -389,6 +399,22 @@ static bool check_should_bypass(struct cached_dev *dc, struct bio *bio)
 	     op_is_write(bio_op(bio))))
 		goto skip;
 
+	/*
+	 * If the bio is for read-ahead or background IO, bypass it or
+	 * not depends on the following situations,
+	 * - If the IO is for meta data, always cache it and no bypass
+	 * - If the IO is not meta data, check dc->cache_reada_policy,
+	 *      BCH_CACHE_READA_ALL: cache it and not bypass
+	 *      BCH_CACHE_READA_META_ONLY: not cache it and bypass
+	 * That is, read-ahead request for metadata always get cached
+	 * (eg, for gfs2 or xfs).
+	 */
+	if ((bio->bi_opf & (REQ_RAHEAD|REQ_BACKGROUND))) {
+		if (!(bio->bi_opf & (REQ_META|REQ_PRIO)) &&
+		    (dc->cache_readahead_policy != BCH_CACHE_READA_ALL))
+			goto skip;
+	}
+
 	if (bio->bi_iter.bi_sector & (c->sb.block_size - 1) ||
 	    bio_sectors(bio) & (c->sb.block_size - 1)) {
 		pr_debug("skipping unaligned io");
@@ -459,26 +485,6 @@ skip:
 }
 
 /* Cache lookup */
-
-struct search {
-	/* Stack frame for bio_complete */
-	struct closure		cl;
-
-	struct bbio		bio;
-	struct bio		*orig_bio;
-	struct bio		*cache_miss;
-	struct bcache_device	*d;
-
-	unsigned		insert_bio_sectors;
-	unsigned		recoverable:1;
-	unsigned		write:1;
-	unsigned		read_dirty_data:1;
-
-	unsigned long		start_time;
-
-	struct btree_op		op;
-	struct data_insert_op	iop;
-};
 
 static void bch_cache_read_endio(struct bio *bio)
 {
@@ -555,21 +561,25 @@ static int cache_lookup_fn(struct btree_op *op, struct btree *b, struct bkey *k)
 	bch_cut_front(&KEY(s->iop.inode, n->bi_iter.bi_sector, 0), bio_key);
 	bch_cut_back(&KEY(s->iop.inode, bio_end_sector(n), 0), bio_key);
 
-	n->bi_end_io	= bch_cache_read_endio;
-	n->bi_private	= &s->cl;
+	if (!s->prefetch) {
+		n->bi_end_io	= bch_cache_read_endio;
+		n->bi_private	= &s->cl;
 
-	/*
-	 * The bucket we're reading from might be reused while our bio
-	 * is in flight, and we could then end up reading the wrong
-	 * data.
-	 *
-	 * We guard against this by checking (in cache_read_endio()) if
-	 * the pointer is stale again; if so, we treat it as an error
-	 * and reread from the backing device (but we don't pass that
-	 * error up anywhere).
-	 */
+		/*
+		 * The bucket we're reading from might be reused while our bio
+		 * is in flight, and we could then end up reading the wrong
+		 * data.
+		 *
+		 * We guard against this by checking (in cache_read_endio()) if
+		 * the pointer is stale again; if so, we treat it as an error
+		 * and reread from the backing device (but we don't pass that
+		 * error up anywhere).
+		 */
 
-	__bch_submit_bbio(n, b->c);
+		__bch_submit_bbio(n, b->c);
+	} else
+		bio_put(n);
+
 	return n == bio ? MAP_DONE : MAP_CONTINUE;
 }
 
@@ -618,7 +628,12 @@ static void bio_complete(struct search *s)
 
 		trace_bcache_request_end(s->d, s->orig_bio);
 		s->orig_bio->bi_status = s->iop.status;
-		bio_endio(s->orig_bio);
+		if (s->prefetch) {
+			bio_free_pages(s->orig_bio);
+			bio_put(s->orig_bio);
+		} else {
+			bio_endio(s->orig_bio);
+		}
 		s->orig_bio = NULL;
 	}
 }
@@ -635,20 +650,23 @@ static void do_bio_hook(struct search *s, struct bio *orig_bio)
 	bio_cnt_set(bio, 3);
 }
 
-static void search_free(struct closure *cl)
+void search_free(struct closure *cl)
 {
 	struct search *s = container_of(cl, struct search, cl);
-	bio_complete(s);
 
 	if (s->iop.bio)
 		bio_put(s->iop.bio);
 
+	if (s->prefetch)
+		inflight_list_ops.remove(s);
+
+	bio_complete(s);
 	closure_debug_destroy(cl);
 	mempool_free(s, s->d->c->search);
 }
 
-static inline struct search *search_alloc(struct bio *bio,
-					  struct bcache_device *d)
+struct search *search_alloc(struct bio *bio,
+					  struct bcache_device *d, bool prefetch)
 {
 	struct search *s;
 
@@ -659,11 +677,13 @@ static inline struct search *search_alloc(struct bio *bio,
 
 	s->orig_bio		= bio;
 	s->cache_miss		= NULL;
+	s->cache_missed		= 0;
 	s->d			= d;
 	s->recoverable		= 1;
 	s->write		= op_is_write(bio_op(bio));
 	s->read_dirty_data	= 0;
 	s->start_time		= jiffies;
+	s->prefetch		= prefetch;
 
 	s->iop.c		= d->c;
 	s->iop.bio		= NULL;
@@ -744,7 +764,8 @@ static void cached_dev_read_done(struct closure *cl)
 		s->iop.bio->bi_iter.bi_size = s->insert_bio_sectors << 9;
 		bch_bio_map(s->iop.bio, NULL);
 
-		bio_copy_data(s->cache_miss, s->iop.bio);
+		if (!s->prefetch)
+			bio_copy_data(s->cache_miss, s->iop.bio);
 
 		bio_put(s->cache_miss);
 		s->cache_miss = NULL;
@@ -753,9 +774,10 @@ static void cached_dev_read_done(struct closure *cl)
 	if (verify(dc, &s->bio.bio) && s->recoverable && !s->read_dirty_data)
 		bch_data_verify(dc, s->orig_bio);
 
-	bio_complete(s);
+	if (!s->prefetch)
+		bio_complete(s);
 
-	if (s->iop.bio &&
+	if (s->iop.bio && (!dc->read_bypass || s->prefetch) &&
 	    !test_bit(CACHE_SET_STOPPING, &s->iop.c->flags)) {
 		BUG_ON(!s->iop.replace);
 		closure_call(&s->iop.cl, bch_data_insert, NULL, cl);
@@ -769,9 +791,18 @@ static void cached_dev_read_done_bh(struct closure *cl)
 	struct search *s = container_of(cl, struct search, cl);
 	struct cached_dev *dc = container_of(s->d, struct cached_dev, disk);
 
-	bch_mark_cache_accounting(s->iop.c, s->d,
-				  !s->cache_miss, s->iop.bypass);
+	if (s->prefetch)
+		pr_debug("prefetch request; do not count cache_missed");
+	else
+		bch_mark_cache_accounting(s->iop.c, s->d,
+				  !s->cache_missed, s->iop.bypass);
 	trace_bcache_read(s->orig_bio, !s->cache_miss, s->iop.bypass);
+
+	if (!s->prefetch && !s->iop.status) {
+		s->smp.opcode = ACACHE_SAMPLE_LATENCY;
+		s->smp.start_time = ktime_get_ns() - s->smp.start_time;
+		save_circ_item(sample_circ, &s->smp);
+	}
 
 	if (s->iop.status)
 		continue_at_nobarrier(cl, cached_dev_read_error, bcache_wq);
@@ -789,15 +820,20 @@ static int cached_dev_cache_miss(struct btree *b, struct search *s,
 	struct cached_dev *dc = container_of(s->d, struct cached_dev, disk);
 	struct bio *miss, *cache_bio;
 
-	if (s->cache_miss || s->iop.bypass) {
+	s->cache_missed = 1;
+
+	if (s->cache_miss || s->iop.bypass ||
+		(dc->read_bypass && !s->prefetch)) {
 		miss = bio_next_split(bio, sectors, GFP_NOIO, s->d->bio_split);
 		ret = miss == bio ? MAP_DONE : MAP_CONTINUE;
 		goto out_submit;
 	}
 
+	//if called form do_readahead, no need to do this
 	if (!(bio->bi_opf & REQ_RAHEAD) &&
 	    !(bio->bi_opf & REQ_META) &&
-	    s->iop.c->gc_stats.in_use < CUTOFF_CACHE_READA)
+	    s->iop.c->gc_stats.in_use < CUTOFF_CACHE_READA &&
+	    !s->prefetch)
 		reada = min_t(sector_t, dc->readahead >> 9,
 			      get_capacity(bio->bi_disk) - bio_end_sector(bio));
 
@@ -847,15 +883,25 @@ static int cached_dev_cache_miss(struct btree *b, struct search *s,
 out_put:
 	bio_put(cache_bio);
 out_submit:
-	miss->bi_end_io		= request_endio;
-	miss->bi_private	= &s->cl;
-	closure_bio_submit(miss, &s->cl);
+	if (!s->prefetch) {
+		miss->bi_end_io		= request_endio;
+		miss->bi_private	= &s->cl;
+		/* I/O request sent to backing device */
+		closure_bio_submit(miss, &s->cl);
+	} else {
+		bio_put(miss);
+	}
 	return ret;
 }
 
-static void cached_dev_read(struct cached_dev *dc, struct search *s)
+void cached_dev_read(struct cached_dev *dc, struct search *s)
 {
 	struct closure *cl = &s->cl;
+
+	if (s->prefetch)
+		inflight_list_ops.insert(s);
+	else if (inflight_list_ops.wait(s))
+		bch_mark_cache_prefetch_fake_hit(s->iop.c, s->d);
 
 	closure_call(&s->iop.cl, cache_lookup, NULL, cl);
 	continue_at(cl, cached_dev_read_done_bh, NULL);
@@ -955,6 +1001,58 @@ static void cached_dev_nodata(struct closure *cl)
 	continue_at(cl, cached_dev_bio_complete, NULL);
 }
 
+struct detached_dev_io_private {
+	struct bcache_device	*d;
+	unsigned long			start_time;
+	bio_end_io_t			*bi_end_io;
+	void					*bi_private;
+};
+
+static void detached_dev_end_io(struct bio *bio)
+{
+	struct detached_dev_io_private *ddip;
+
+	ddip = bio->bi_private;
+	bio->bi_end_io = ddip->bi_end_io;
+	bio->bi_private = ddip->bi_private;
+
+	generic_end_io_acct(ddip->d->disk->queue,
+						bio_data_dir(bio),
+						&ddip->d->disk->part0, ddip->start_time);
+
+	kfree(ddip);
+
+	bio->bi_end_io(bio);
+}
+
+static void detached_dev_do_request(struct bcache_device *d, struct bio *bio)
+{
+	struct detached_dev_io_private *ddip;
+	struct cached_dev *dc = container_of(d, struct cached_dev, disk);
+
+	/*
+	 * no need to call closure_get(&dc->disk.cl),
+	 * because upper layer had already opened bcache device,
+	 * which would call closure_get(&dc->disk.cl)
+	 */
+	ddip = kzalloc(sizeof(struct detached_dev_io_private), GFP_NOIO);
+	if (ddip == NULL) {
+		return ;
+	}
+	ddip->d = d;
+	ddip->start_time = jiffies;
+	ddip->bi_end_io = bio->bi_end_io;
+	ddip->bi_private = bio->bi_private;
+	bio->bi_end_io = detached_dev_end_io;
+	bio->bi_private = ddip;
+
+	if ((bio_op(bio) == REQ_OP_DISCARD) &&
+		!blk_queue_discard(bdev_get_queue(dc->bdev)))
+		bio->bi_end_io(bio);
+	else
+		generic_make_request(bio);
+}
+
 /* Cached devices - read & write stuff */
 
 static blk_qc_t cached_dev_make_request(struct request_queue *q,
@@ -971,7 +1069,7 @@ static blk_qc_t cached_dev_make_request(struct request_queue *q,
 	bio->bi_iter.bi_sector += dc->sb.data_offset;
 
 	if (cached_dev_get(dc)) {
-		s = search_alloc(bio, d);
+		s = search_alloc(bio, d, false);
 		trace_bcache_request_start(s->d, bio);
 
 		if (!bio->bi_iter.bi_size) {
@@ -985,18 +1083,27 @@ static blk_qc_t cached_dev_make_request(struct request_queue *q,
 		} else {
 			s->iop.bypass = check_should_bypass(dc, bio);
 
+			/*
+			 * put bio to ringbuffer
+			 * we should put this bufer bio_set_dev
+			 * we should not exclue backing dev to user
+			 */
+			if (!s->iop.bypass && bio->bi_iter.bi_size && !rw) {
+				s->smp.offset = bio->bi_iter.bi_sector - dc->sb.data_offset;
+				s->smp.length = bio->bi_iter.bi_size;
+				s->smp.opcode = rw;
+				s->smp.dev = dc->bdev->bd_dev;
+				s->smp.start_time = ktime_get_ns();
+				save_circ_item(sample_circ, &s->smp);
+			}
+
 			if (rw)
 				cached_dev_write(dc, s);
 			else
 				cached_dev_read(dc, s);
 		}
-	} else {
-		if ((bio_op(bio) == REQ_OP_DISCARD) &&
-		    !blk_queue_discard(bdev_get_queue(dc->bdev)))
-			bio_endio(bio);
-		else
-			generic_make_request(bio);
-	}
+	} else 
+		detached_dev_do_request(d, bio);
 
 	return BLK_QC_T_NONE;
 }
@@ -1082,7 +1189,7 @@ static blk_qc_t flash_dev_make_request(struct request_queue *q,
 
 	generic_start_io_acct(q, rw, bio_sectors(bio), &d->disk->part0);
 
-	s = search_alloc(bio, d);
+	s = search_alloc(bio, d, false);
 	cl = &s->cl;
 	bio = &s->bio.bio;
 
