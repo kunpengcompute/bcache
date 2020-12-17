@@ -176,7 +176,11 @@
  * - updates to non leaf nodes just happen synchronously (see btree_split()).
  */
 
+#ifdef pr_fmt
+#undef pr_fmt
+
 #define pr_fmt(fmt) "bcache: %s() " fmt "\n", __func__
+#endif
 
 #include <linux/bcache.h>
 #include <linux/bio.h>
@@ -187,6 +191,7 @@
 #include <linux/rwsem.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
+#include <linux/device-mapper.h>
 
 #include "bset.h"
 #include "util.h"
@@ -288,12 +293,66 @@ struct io {
 	sector_t		last;
 };
 
+#define SB_OFFSET			(SB_SECTOR << SECTOR_SHIFT)
+
+struct cache_sb_disk {
+	__le64			csum;
+	__le64			offset;	/* sector where this sb was written */
+	__le64			version;
+
+	__u8			magic[16];
+
+	__u8			uuid[16];
+	union {
+		__u8		set_uuid[16];
+		__le64		set_magic;
+	};
+	__u8			label[SB_LABEL_SIZE];
+
+	__le64			flags;
+	__le64			seq;
+	__le64			pad[8];
+
+	union {
+	struct {
+		/* Cache devices */
+		__le64		nbuckets;	/* device size */
+
+		__le16		block_size;	/* sectors */
+		__le16		bucket_size;	/* sectors */
+
+		__le16		nr_in_set;
+		__le16		nr_this_dev;
+	};
+	struct {
+		/* Backing devices */
+		__le64		data_offset;
+
+		/*
+		 * block_size from the cache device section is still used by
+		 * backing devices, so don't add anything here until we fix
+		 * things to not need it for backing devices anymore
+		 */
+	};
+	};
+
+	__le32			last_mount;	/* time overflow in y2106 */
+
+	__le16			first_bucket;
+	union {
+		__le16		njournal_buckets;
+		__le16		keys;
+	};
+	__le64			d[SB_JOURNAL_BUCKETS];	/* journal buckets */
+};
+
 struct cached_dev {
 	struct list_head	list;
 	struct bcache_device	disk;
 	struct block_device	*bdev;
 
 	struct cache_sb		sb;
+	struct cache_sb_disk	*sb_disk;
 	struct bio		sb_bio;
 	struct bio_vec		sb_bv[1];
 	struct closure		sb_write;
@@ -321,7 +380,10 @@ struct cached_dev {
 	 * shared lock to set and exclusive lock to clear.
 	 */
 	atomic_t		has_dirty;
-
+	
+#define BCH_CACHE_READA_ALL		0
+#define BCH_CACHE_READA_META_ONLY	1
+	unsigned int		cache_readahead_policy;
 	struct bch_ratelimit	writeback_rate;
 	struct delayed_work	writeback_rate_update;
 
@@ -361,6 +423,10 @@ struct cached_dev {
 	unsigned char		writeback_percent;
 	unsigned		writeback_delay;
 
+	unsigned int		inflight_block_enable;
+	unsigned int		read_bypass;
+	unsigned int		insert_without_placeholder;
+
 	uint64_t		writeback_rate_target;
 	int64_t			writeback_rate_proportional;
 	int64_t			writeback_rate_derivative;
@@ -382,6 +448,7 @@ enum alloc_reserve {
 struct cache {
 	struct cache_set	*set;
 	struct cache_sb		sb;
+	struct cache_sb_disk	*sb_disk;
 	struct bio		sb_bio;
 	struct bio_vec		sb_bv[1];
 
