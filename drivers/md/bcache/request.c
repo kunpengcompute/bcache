@@ -384,7 +384,7 @@ static bool check_should_bypass(struct cached_dev *dc, struct bio *bio)
 	struct cache_set *c = dc->disk.c;
 	unsigned mode = cache_mode(dc, bio);
 	unsigned sectors, congested = bch_get_congested(c);
-#if defined(CONFIG_BCACHE) || defined(CONFIG_BCAHCE_MODULE)
+#if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
 	struct task_struct *task = current;
 #endif
 	struct io *i;
