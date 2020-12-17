@@ -16,6 +16,12 @@
 #include <linux/sort.h>
 #include <linux/sched/clock.h>
 
+static const char * const bch_reada_cache_policies[] = {
+	"all",
+	"meta-only",
+	NULL
+};
+
 static const char * const cache_replacement_policies[] = {
 	"lru",
 	"fifo",
@@ -75,8 +81,12 @@ rw_attribute(congested_write_threshold_us);
 #if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
 rw_attribute(sequential_cutoff);
 #endif
+rw_attribute(read_bypass);
+rw_attribute(insert_without_placeholder);
+rw_attribute(inflight_block_enable);
 rw_attribute(data_csum);
 rw_attribute(cache_mode);
+rw_attribute(readahead_cache_policy);
 rw_attribute(writeback_metadata);
 rw_attribute(writeback_running);
 rw_attribute(writeback_percent);
@@ -123,6 +133,11 @@ SHOW(__bch_cached_dev)
 					       bch_cache_modes + 1,
 					       BDEV_CACHE_MODE(&dc->sb));
 
+	if (attr == &sysfs_readahead_cache_policy)
+		return bch_snprint_string_list(buf, PAGE_SIZE,
+					      bch_reada_cache_policies,
+					      dc->cache_readahead_policy);
+
 	sysfs_printf(data_csum,		"%i", dc->disk.data_csum);
 	var_printf(verify,		"%i");
 	var_printf(bypass_torture_test,	"%i");
@@ -131,6 +146,7 @@ SHOW(__bch_cached_dev)
 	var_print(writeback_delay);
 	var_print(writeback_percent);
 	sysfs_hprint(writeback_rate,	dc->writeback_rate.rate << 9);
+	//sysfs_printf(io_errors,		"%i", atomic_read(&dc->io_errors));
 
 	var_print(writeback_rate_update_seconds);
 	var_print(writeback_rate_d_term);
@@ -176,6 +192,9 @@ SHOW(__bch_cached_dev)
 #if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
 	var_hprint(sequential_cutoff);
 #endif
+	var_print(inflight_block_enable);
+	var_print(read_bypass);
+	var_print(insert_without_placeholder);
 	var_hprint(readahead);
 
 	sysfs_print(running,		atomic_read(&dc->running));
@@ -224,6 +243,16 @@ STORE(__cached_dev)
 #if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
 	d_strtoi_h(sequential_cutoff);
 #endif
+
+	sysfs_strtoul_clamp(read_bypass,
+			    dc->read_bypass,
+			    0, 1);
+	sysfs_strtoul_clamp(insert_without_placeholder,
+			    dc->insert_without_placeholder,
+			    0, 1);
+	sysfs_strtoul_clamp(inflight_block_enable,
+			    dc->inflight_block_enable,
+			    0, 1);
 	d_strtoi_h(readahead);
 
 	if (attr == &sysfs_clear_stats)
@@ -243,6 +272,15 @@ STORE(__cached_dev)
 			SET_BDEV_CACHE_MODE(&dc->sb, v);
 			bch_write_bdev_super(dc, NULL);
 		}
+	}
+
+	if (attr == &sysfs_readahead_cache_policy) {
+		v = __sysfs_match_string(bch_reada_cache_policies, -1, buf);
+		if (v < 0)
+			return v;
+
+		if ((unsigned int) v != dc->cache_readahead_policy)
+			dc->cache_readahead_policy = v;
 	}
 
 	if (attr == &sysfs_label) {
@@ -320,6 +358,7 @@ static struct attribute *bch_cached_dev_files[] = {
 	&sysfs_data_csum,
 #endif
 	&sysfs_cache_mode,
+	&sysfs_readahead_cache_policy,
 	&sysfs_writeback_metadata,
 	&sysfs_writeback_running,
 	&sysfs_writeback_delay,
@@ -335,6 +374,9 @@ static struct attribute *bch_cached_dev_files[] = {
 #if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
 	&sysfs_sequential_cutoff,
 #endif
+	&sysfs_read_bypass,
+	&sysfs_insert_without_placeholder,
+	&sysfs_inflight_block_enable,
 	&sysfs_clear_stats,
 	&sysfs_running,
 	&sysfs_state,
@@ -754,6 +796,11 @@ static struct attribute *bch_cache_set_internal_files[] = {
 };
 KTYPE(bch_cache_set_internal);
 
+static int __bch_cache_cmp(const void *l, const void *r)
+{
+	return *((uint16_t *)r) - *((uint16_t *)l);
+}
+
 SHOW(__bch_cache)
 {
 	struct cache *ca = container_of(kobj, struct cache, kobj);
@@ -778,9 +825,6 @@ SHOW(__bch_cache)
 					       CACHE_REPLACEMENT(&ca->sb));
 
 	if (attr == &sysfs_priority_stats) {
-		int cmp(const void *l, const void *r)
-		{	return *((uint16_t *) r) - *((uint16_t *) l); }
-
 		struct bucket *b;
 		size_t n = ca->sb.nbuckets, i;
 		size_t unused = 0, available = 0, dirty = 0, meta = 0;
@@ -809,7 +853,7 @@ SHOW(__bch_cache)
 			p[i] = ca->buckets[i].prio;
 		mutex_unlock(&ca->set->bucket_lock);
 
-		sort(p, n, sizeof(uint16_t), cmp, NULL);
+		sort(p, n, sizeof(uint16_t), __bch_cache_cmp, NULL);
 
 		while (n &&
 		       !cached[n - 1])
