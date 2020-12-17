@@ -1111,8 +1111,11 @@ static int cached_dev_init(struct cached_dev *dc, unsigned block_size)
 	spin_lock_init(&dc->io_lock);
 	bch_cache_accounting_init(&dc->accounting, &dc->disk.cl);
 
+#if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
 	dc->sequential_cutoff		= 4 << 20;
-
+#else
+	dc->sequential_cutoff		= 0;
+#endif
 	for (io = dc->io; io < dc->io + RECENT_IO; io++) {
 		list_add(&io->lru, &dc->io_lru);
 		hlist_add_head(&io->hash, dc->io_hash + RECENT_IO);

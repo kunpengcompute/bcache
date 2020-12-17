@@ -72,7 +72,9 @@ read_attribute(congested);
 rw_attribute(congested_read_threshold_us);
 rw_attribute(congested_write_threshold_us);
 
+#if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
 rw_attribute(sequential_cutoff);
+#endif
 rw_attribute(data_csum);
 rw_attribute(cache_mode);
 rw_attribute(writeback_metadata);
@@ -171,7 +173,9 @@ SHOW(__bch_cached_dev)
 	sysfs_hprint(stripe_size,	dc->disk.stripe_size << 9);
 	var_printf(partial_stripes_expensive,	"%u");
 
+#if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
 	var_hprint(sequential_cutoff);
+#endif
 	var_hprint(readahead);
 
 	sysfs_print(running,		atomic_read(&dc->running));
@@ -217,7 +221,9 @@ STORE(__cached_dev)
 	d_strtoul(writeback_rate_d_term);
 	d_strtoul_nonzero(writeback_rate_p_term_inverse);
 
+#if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
 	d_strtoi_h(sequential_cutoff);
+#endif
 	d_strtoi_h(readahead);
 
 	if (attr == &sysfs_clear_stats)
@@ -326,7 +332,9 @@ static struct attribute *bch_cached_dev_files[] = {
 	&sysfs_dirty_data,
 	&sysfs_stripe_size,
 	&sysfs_partial_stripes_expensive,
+#if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
 	&sysfs_sequential_cutoff,
+#endif
 	&sysfs_clear_stats,
 	&sysfs_running,
 	&sysfs_state,
