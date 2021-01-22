@@ -1,9 +1,18 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
+ * Copyright (C) 2021. Huawei Technologies Co., Ltd.
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 and
+ * only version 2 as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ */
+/*
  * acache device - provide interfaces for user space to visit ringbuffer 
  * that store a series of bio sample info
- *
- * Copyright (c) Huawei Technologies Co., Ltd. 2020-2020. All rights reserved.
  */
 
 #include <linux/module.h>
