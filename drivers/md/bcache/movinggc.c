@@ -139,7 +139,7 @@ static void read_moving(struct cache_set *c)
 		if (!w)
 			break;
 
-		if (ptr_stale(c, &w->key, 0)) {
+		if (ptr_stale(c, &w->key, 0) || (!KEY_DIRTY(&w->key))) {
 			bch_keybuf_del(&c->moving_gc_keys, w);
 			continue;
 		}
@@ -183,13 +183,13 @@ err:		if (!IS_ERR_OR_NULL(w->private))
 
 static bool bucket_cmp(struct bucket *l, struct bucket *r)
 {
-	return GC_SECTORS_USED(l) < GC_SECTORS_USED(r);
+	return GC_DIRTY_SECTORS(l) < GC_DIRTY_SECTORS(r);
 }
 
 static unsigned bucket_heap_top(struct cache *ca)
 {
 	struct bucket *b;
-	return (b = heap_peek(&ca->heap)) ? GC_SECTORS_USED(b) : 0;
+	return (b = heap_peek(&ca->heap)) ? GC_DIRTY_SECTORS(b) : 0;
 }
 
 void bch_moving_gc(struct cache_set *c)
@@ -212,17 +212,16 @@ void bch_moving_gc(struct cache_set *c)
 
 		for_each_bucket(b, ca) {
 			if (GC_MARK(b) == GC_MARK_METADATA ||
-			    !GC_SECTORS_USED(b) ||
-			    GC_SECTORS_USED(b) == ca->sb.bucket_size ||
+			    !GC_DIRTY_SECTORS(b) ||
 			    atomic_read(&b->pin))
 				continue;
 
 			if (!heap_full(&ca->heap)) {
-				sectors_to_move += GC_SECTORS_USED(b);
+				sectors_to_move += GC_DIRTY_SECTORS(b);
 				heap_add(&ca->heap, b, bucket_cmp);
 			} else if (bucket_cmp(b, heap_peek(&ca->heap))) {
 				sectors_to_move -= bucket_heap_top(ca);
-				sectors_to_move += GC_SECTORS_USED(b);
+				sectors_to_move += GC_DIRTY_SECTORS(b);
 
 				ca->heap.data[0] = b;
 				heap_sift(&ca->heap, 0, bucket_cmp);
@@ -231,7 +230,7 @@ void bch_moving_gc(struct cache_set *c)
 
 		while (sectors_to_move > reserve_sectors) {
 			heap_pop(&ca->heap, b, bucket_cmp);
-			sectors_to_move -= GC_SECTORS_USED(b);
+			sectors_to_move -= GC_DIRTY_SECTORS(b);
 		}
 
 		while (heap_pop(&ca->heap, b, bucket_cmp))

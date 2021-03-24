@@ -183,10 +183,12 @@
 #include <linux/kobject.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
+#include <linux/ioctl.h>
 #include <linux/rbtree.h>
 #include <linux/rwsem.h>
 #include <linux/types.h>
 #include <linux/workqueue.h>
+#include <linux/device-mapper.h>
 
 #include "bset.h"
 #include "util.h"
@@ -197,7 +199,7 @@ struct bucket {
 	uint16_t	prio;
 	uint8_t		gen;
 	uint8_t		last_gc; /* Most out of date gen in the btree */
-	uint16_t	gc_mark; /* Bitfield used by GC. See below for field */
+	uint32_t	gc_mark; /* Bitfield used by GC. See below for field */
 };
 
 /*
@@ -213,6 +215,8 @@ BITMASK(GC_MARK,	 struct bucket, gc_mark, 0, 2);
 #define MAX_GC_SECTORS_USED	(~(~0ULL << GC_SECTORS_USED_SIZE))
 BITMASK(GC_SECTORS_USED, struct bucket, gc_mark, 2, GC_SECTORS_USED_SIZE);
 BITMASK(GC_MOVE, struct bucket, gc_mark, 15, 1);
+BITMASK(GC_DIRTY_SECTORS, struct bucket, gc_mark, 16, GC_SECTORS_USED_SIZE);
+BITMASK(GC_BUCKET_USED, struct bucket, gc_mark, 29, 1);
 
 #include "journal.h"
 #include "stats.h"
@@ -288,12 +292,66 @@ struct io {
 	sector_t		last;
 };
 
+#define SB_OFFSET (SB_SECTOR << SECTOR_SHIFT)
+
+struct cache_sb_disk {
+	__le64			csum;
+	__le64			offset; /* sector where this sb was written */
+	__le64			version;
+
+	__u8			magic[16];
+
+	__u8			uuid[16];
+	union {
+		__u8		set_uuid[16];
+		__le64		set_magic;
+	};
+	__u8			label[SB_LABEL_SIZE];
+
+	__le64			flags;
+	__le64			seq;
+	__le64			pad[8];
+
+	union {
+	struct {
+		/* Cache devices */
+		__le64		nbuckets; /*device size*/
+
+		__le16		block_size; /* sectors */
+		__le16		bucket_size; /* sectors */
+
+		__le16		nr_in_set;
+		__le16		nr_this_dev;
+	};
+	struct {
+		/* Backing devices */
+		__le64		data_offset;
+
+		/*
+		 * block_size from the cache device section is still used by
+		 * backing devices, so don't add anything here until we fix
+		 * things to not need it for backing devices anymore
+		 */
+	};
+	};
+
+	__le32			last_mount; /* time overflow in y2106 */
+
+	__le16			first_bucket;
+	union {
+		__le16		njournal_buckets;
+		__le16		keys;
+	};
+	__le64			d[SB_JOURNAL_BUCKETS]; /* journal buckets */
+};
+
 struct cached_dev {
 	struct list_head	list;
 	struct bcache_device	disk;
 	struct block_device	*bdev;
 
 	struct cache_sb		sb;
+	struct cache_sb_disk	*sb_disk;
 	struct bio		sb_bio;
 	struct bio_vec		sb_bv[1];
 	struct closure		sb_write;
@@ -369,6 +427,28 @@ struct cached_dev {
 	unsigned		writeback_rate_update_seconds;
 	unsigned		writeback_rate_d_term;
 	unsigned		writeback_rate_p_term_inverse;
+
+	/* Count the front and writeback io bandwidth per second */
+	atomic_t		writeback_sector_size;
+	atomic_t		writeback_io_num;
+	atomic_t		front_io_num;
+	unsigned		writeback_sector_size_per_sec;
+	unsigned		writeback_io_num_per_sec;
+	unsigned		front_io_num_per_sec;
+	struct timer_list	io_stat_timer;
+
+	unsigned		writeback_state;
+#define WRITEBACK_DEFAULT  0
+#define WRITEBACK_QUICK    1
+#define WRITEBACK_SLOW     2
+
+	/* realize for token bucket */
+	spinlock_t		token_lock;
+	unsigned		max_sector_size;
+	unsigned		max_io_num;
+	unsigned		write_token_sector_size;
+	unsigned		write_token_io_num;
+	struct timer_list	token_assign_timer;
 };
 
 enum alloc_reserve {
@@ -382,6 +462,7 @@ enum alloc_reserve {
 struct cache {
 	struct cache_set	*set;
 	struct cache_sb		sb;
+	struct cache_sb_disk	*sb_disk;
 	struct bio		sb_bio;
 	struct bio_vec		sb_bv[1];
 
@@ -664,6 +745,9 @@ struct cache_set {
 
 #define BUCKET_HASH_BITS	12
 	struct hlist_head	bucket_hash[1 << BUCKET_HASH_BITS];
+	bool			traffic_policy_start;
+	bool			force_write_through;
+	unsigned		gc_sectors;
 };
 
 struct bbio {
@@ -678,6 +762,28 @@ struct bbio {
 	};
 	struct bio		bio;
 };
+
+struct get_bcache_status {
+	unsigned		writeback_sector_size_per_sec;
+	unsigned		writeback_io_num_per_sec;
+	unsigned		front_io_num_per_sec;
+	uint64_t		dirty_rate;
+	unsigned		available;
+};
+
+struct set_bcache_status {
+	unsigned		write_token_sector_size;
+	unsigned		write_token_io_num;
+	bool			traffic_policy_start;
+	bool			force_write_through;
+	bool			copy_gc_enabled;
+	bool			trigger_gc;
+	unsigned		writeback_state;
+	unsigned		gc_sectors;
+};
+#define BCACHE_MAJOR 'B'
+#define BCACHE_GET_ALL_STATUS _IOR(BCACHE_MAJOR, 0x0, struct get_bcache_status)
+#define BCACHE_SET_ALL_STATUS _IOW(BCACHE_MAJOR, 0x1, struct set_bcache_status)
 
 #define BTREE_PRIO		USHRT_MAX
 #define INITIAL_PRIO		32768U

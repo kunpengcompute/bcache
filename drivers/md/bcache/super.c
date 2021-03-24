@@ -63,17 +63,19 @@ struct workqueue_struct *bcache_wq;
 /* Superblock */
 
 static const char *read_super(struct cache_sb *sb, struct block_device *bdev,
-			      struct page **res)
+			      struct cache_sb_disk **res)
 {
 	const char *err;
-	struct cache_sb *s;
-	struct buffer_head *bh = __bread(bdev, 1, SB_SIZE);
+	struct cache_sb_disk *s;
+	struct page *page;
 	unsigned i;
 
-	if (!bh)
+	page = read_cache_page_gfp(bdev->bd_inode->i_mapping,
+		SB_OFFSET >> PAGE_SHIFT, GFP_KERNEL);
+	if (IS_ERR(page))
 		return "IO error";
 
-	s = (struct cache_sb *) bh->b_data;
+	s = page_address(page) + offset_in_page(SB_OFFSET);
 
 	sb->offset		= le64_to_cpu(s->offset);
 	sb->version		= le64_to_cpu(s->version);
@@ -189,12 +191,10 @@ static const char *read_super(struct cache_sb *sb, struct block_device *bdev,
 	}
 
 	sb->last_mount = get_seconds();
-	err = NULL;
-
-	get_page(bh->b_page);
-	*res = bh->b_page;
+	*res = s;
+	return NULL;
 err:
-	put_bh(bh);
+	put_page(page);
 	return err;
 }
 
@@ -206,15 +206,15 @@ static void write_bdev_super_endio(struct bio *bio)
 	closure_put(&dc->sb_write);
 }
 
-static void __write_super(struct cache_sb *sb, struct bio *bio)
+static void __write_super(struct cache_sb *sb, struct cache_sb_disk *out,
+	struct bio *bio)
 {
-	struct cache_sb *out = page_address(bio->bi_io_vec[0].bv_page);
 	unsigned i;
 
+	bio->bi_opf = REQ_OP_WRITE | REQ_SYNC | REQ_META;
 	bio->bi_iter.bi_sector	= SB_SECTOR;
-	bio->bi_iter.bi_size	= SB_SIZE;
-	bio_set_op_attrs(bio, REQ_OP_WRITE, REQ_SYNC|REQ_META);
-	bch_bio_map(bio, NULL);
+	bio_add_page(bio, virt_to_page(out), SB_SIZE,
+		offset_in_page(out));
 
 	out->offset		= cpu_to_le64(sb->offset);
 	out->version		= cpu_to_le64(sb->version);
@@ -256,13 +256,13 @@ void bch_write_bdev_super(struct cached_dev *dc, struct closure *parent)
 	down(&dc->sb_write_mutex);
 	closure_init(cl, parent);
 
-	bio_reset(bio);
+	bio_init(bio, dc->sb_bv, 1);
 	bio_set_dev(bio, dc->bdev);
 	bio->bi_end_io	= write_bdev_super_endio;
 	bio->bi_private = dc;
 
 	closure_get(cl);
-	__write_super(&dc->sb, bio);
+	__write_super(&dc->sb, dc->sb_disk, bio);
 
 	closure_return_with_destructor(cl, bch_write_bdev_super_unlock);
 }
@@ -302,13 +302,13 @@ void bcache_write_super(struct cache_set *c)
 
 		SET_CACHE_SYNC(&ca->sb, CACHE_SYNC(&c->sb));
 
-		bio_reset(bio);
+		bio_init(bio, ca->sb_bv, 1);
 		bio_set_dev(bio, ca->bdev);
 		bio->bi_end_io	= write_super_endio;
 		bio->bi_private = ca;
 
 		closure_get(cl);
-		__write_super(&ca->sb, bio);
+		__write_super(&ca->sb, ca->sb_disk, bio);
 	}
 
 	closure_return_with_destructor(cl, bcache_write_super_unlock);
@@ -1056,6 +1056,8 @@ static void cached_dev_free(struct closure *cl)
 {
 	struct cached_dev *dc = container_of(cl, struct cached_dev, disk.cl);
 
+	del_timer_sync(&dc->io_stat_timer);
+	del_timer_sync(&dc->token_assign_timer);
 	cancel_delayed_work_sync(&dc->writeback_rate_update);
 	if (!IS_ERR_OR_NULL(dc->writeback_thread))
 		kthread_stop(dc->writeback_thread);
@@ -1070,6 +1072,9 @@ static void cached_dev_free(struct closure *cl)
 	list_del(&dc->list);
 
 	mutex_unlock(&bch_register_lock);
+
+	if (dc->sb_disk)
+		put_page(virt_to_page(dc->sb_disk));
 
 	if (!IS_ERR_OR_NULL(dc->bdev))
 		blkdev_put(dc->bdev, FMODE_READ|FMODE_WRITE|FMODE_EXCL);
@@ -1094,6 +1099,37 @@ static void cached_dev_flush(struct closure *cl)
 	continue_at(cl, cached_dev_free, system_wq);
 }
 
+static void cached_dev_io_stat(unsigned long data)
+{
+	struct cached_dev *dc = (struct cached_dev *)data;
+
+	dc->io_stat_timer.expires = jiffies + HZ;
+	add_timer(&dc->io_stat_timer);
+
+	dc->writeback_sector_size_per_sec = atomic_read(&dc->writeback_sector_size);
+	dc->writeback_io_num_per_sec = atomic_read(&dc->writeback_io_num);
+	dc->front_io_num_per_sec = atomic_read(&dc->front_io_num);
+	atomic_set(&dc->writeback_sector_size, 0);
+	atomic_set(&dc->writeback_io_num, 0);
+	atomic_set(&dc->front_io_num, 0);
+}
+
+static void cached_dev_timer_init(struct cached_dev *dc)
+{
+	dc->writeback_sector_size_per_sec = 0;
+	dc->writeback_io_num_per_sec = 0;
+	dc->front_io_num_per_sec = 0;
+	atomic_set(&dc->writeback_sector_size, 0);
+	atomic_set(&dc->writeback_io_num, 0);
+	atomic_set(&dc->front_io_num, 0);
+
+	init_timer(&dc->io_stat_timer);
+	dc->io_stat_timer.expires = jiffies + HZ;
+	dc->io_stat_timer.data = (unsigned long)dc;
+	dc->io_stat_timer.function = cached_dev_io_stat;
+	add_timer(&dc->io_stat_timer);
+}
+
 static int cached_dev_init(struct cached_dev *dc, unsigned block_size)
 {
 	int ret;
@@ -1110,6 +1146,8 @@ static int cached_dev_init(struct cached_dev *dc, unsigned block_size)
 	INIT_LIST_HEAD(&dc->io_lru);
 	spin_lock_init(&dc->io_lock);
 	bch_cache_accounting_init(&dc->accounting, &dc->disk.cl);
+	cached_dev_timer_init(dc);
+	bch_traffic_policy_init(dc);
 
 	dc->sequential_cutoff		= 4 << 20;
 
@@ -1143,7 +1181,7 @@ static int cached_dev_init(struct cached_dev *dc, unsigned block_size)
 
 /* Cached device - bcache superblock */
 
-static void register_bdev(struct cache_sb *sb, struct page *sb_page,
+static void register_bdev(struct cache_sb *sb, struct cache_sb_disk *sb_disk,
 				 struct block_device *bdev,
 				 struct cached_dev *dc)
 {
@@ -1155,9 +1193,7 @@ static void register_bdev(struct cache_sb *sb, struct page *sb_page,
 	dc->bdev = bdev;
 	dc->bdev->bd_holder = dc;
 
-	bio_init(&dc->sb_bio, dc->sb_bio.bi_inline_vecs, 1);
-	dc->sb_bio.bi_io_vec[0].bv_page = sb_page;
-	get_page(sb_page);
+	dc->sb_disk = sb_disk;
 
 	if (cached_dev_init(dc, sb->block_size << 9))
 		goto err;
@@ -1799,8 +1835,8 @@ void bch_cache_release(struct kobject *kobj)
 	for (i = 0; i < RESERVE_NR; i++)
 		free_fifo(&ca->free[i]);
 
-	if (ca->sb_bio.bi_inline_vecs[0].bv_page)
-		put_page(ca->sb_bio.bi_io_vec[0].bv_page);
+	if (ca->sb_disk)
+		put_page(virt_to_page(ca->sb_disk));
 
 	if (!IS_ERR_OR_NULL(ca->bdev))
 		blkdev_put(ca->bdev, FMODE_READ|FMODE_WRITE|FMODE_EXCL);
@@ -1842,7 +1878,7 @@ static int cache_alloc(struct cache *ca)
 	return 0;
 }
 
-static int register_cache(struct cache_sb *sb, struct page *sb_page,
+static int register_cache(struct cache_sb *sb, struct cache_sb_disk *sb_disk,
 				struct block_device *bdev, struct cache *ca)
 {
 	char name[BDEVNAME_SIZE];
@@ -1853,9 +1889,7 @@ static int register_cache(struct cache_sb *sb, struct page *sb_page,
 	ca->bdev = bdev;
 	ca->bdev->bd_holder = ca;
 
-	bio_init(&ca->sb_bio, ca->sb_bio.bi_inline_vecs, 1);
-	ca->sb_bio.bi_io_vec[0].bv_page = sb_page;
-	get_page(sb_page);
+	ca->sb_disk = sb_disk;
 
 	if (blk_queue_discard(bdev_get_queue(ca->bdev)))
 		ca->discard = CACHE_DISCARD(&ca->sb);
@@ -1941,8 +1975,8 @@ static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 	const char *err = "cannot allocate memory";
 	char *path = NULL;
 	struct cache_sb *sb = NULL;
+	struct cache_sb_disk *sb_disk = NULL;
 	struct block_device *bdev = NULL;
-	struct page *sb_page = NULL;
 
 	if (!try_module_get(THIS_MODULE))
 		return -EBUSY;
@@ -1976,7 +2010,7 @@ static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 	if (set_blocksize(bdev, 4096))
 		goto err_close;
 
-	err = read_super(sb, bdev, &sb_page);
+	err = read_super(sb, bdev, &sb_disk);
 	if (err)
 		goto err_close;
 
@@ -1986,19 +2020,19 @@ static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 			goto err_close;
 
 		mutex_lock(&bch_register_lock);
-		register_bdev(sb, sb_page, bdev, dc);
+		register_bdev(sb, sb_disk, bdev, dc);
 		mutex_unlock(&bch_register_lock);
 	} else {
 		struct cache *ca = kzalloc(sizeof(*ca), GFP_KERNEL);
 		if (!ca)
 			goto err_close;
 
-		if (register_cache(sb, sb_page, bdev, ca) != 0)
+		if (register_cache(sb, sb_disk, bdev, ca) != 0)
 			goto err_close;
 	}
 out:
-	if (sb_page)
-		put_page(sb_page);
+	if ((sb_disk) && (ret < 0))
+		put_page(virt_to_page(sb_disk));
 	kfree(sb);
 	kfree(path);
 	module_put(THIS_MODULE);

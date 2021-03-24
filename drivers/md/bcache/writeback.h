@@ -3,7 +3,7 @@
 #define _BCACHE_WRITEBACK_H
 
 #define CUTOFF_WRITEBACK	40
-#define CUTOFF_WRITEBACK_SYNC	70
+#define CUTOFF_WRITEBACK_SYNC	85
 
 static inline uint64_t bcache_dev_sectors_dirty(struct bcache_device *d)
 {

@@ -1201,12 +1201,16 @@ static uint8_t __bch_btree_mark_key(struct cache_set *c, int level,
 			     c, "inconsistent ptrs: mark = %llu, level = %i",
 			     GC_MARK(g), level);
 
-		if (level)
+		if (level) {
 			SET_GC_MARK(g, GC_MARK_METADATA);
-		else if (KEY_DIRTY(k))
+		} else if (KEY_DIRTY(k)) {
 			SET_GC_MARK(g, GC_MARK_DIRTY);
-		else if (!GC_MARK(g))
+			SET_GC_DIRTY_SECTORS(g, min_t(unsigned,
+				GC_DIRTY_SECTORS(g) + KEY_SIZE(k),
+				MAX_GC_SECTORS_USED));
+		} else if (!GC_MARK(g)) {
 			SET_GC_MARK(g, GC_MARK_RECLAIMABLE);
+		}
 
 		/* guard against overflow */
 		SET_GC_SECTORS_USED(g, min_t(unsigned,
@@ -1646,6 +1650,7 @@ static void btree_gc_start(struct cache_set *c)
 			if (!atomic_read(&b->pin)) {
 				SET_GC_MARK(b, 0);
 				SET_GC_SECTORS_USED(b, 0);
+				SET_GC_DIRTY_SECTORS(b, 0);
 			}
 		}
 

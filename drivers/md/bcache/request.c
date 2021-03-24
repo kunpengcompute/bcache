@@ -26,6 +26,7 @@
 struct kmem_cache *bch_search_cache;
 
 static void bch_data_insert_start(struct closure *);
+static void alloc_token(struct cached_dev *dc, unsigned sectors);
 
 static unsigned cache_mode(struct cached_dev *dc, struct bio *bio)
 {
@@ -354,6 +355,7 @@ unsigned bch_get_congested(struct cache_set *c)
 	return i > 0 ? i : 1;
 }
 
+#if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
 static void add_sequential(struct task_struct *t)
 {
 	ewma_add(t->sequential_io_avg,
@@ -361,6 +363,7 @@ static void add_sequential(struct task_struct *t)
 
 	t->sequential_io = 0;
 }
+#endif
 
 static struct hlist_head *iohash(struct cached_dev *dc, uint64_t k)
 {
@@ -372,7 +375,9 @@ static bool check_should_bypass(struct cached_dev *dc, struct bio *bio)
 	struct cache_set *c = dc->disk.c;
 	unsigned mode = cache_mode(dc, bio);
 	unsigned sectors, congested = bch_get_congested(c);
+#if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
 	struct task_struct *task = current;
+#endif
 	struct io *i;
 
 	if (test_bit(BCACHE_DEV_DETACHING, &dc->disk.flags) ||
@@ -381,7 +386,7 @@ static bool check_should_bypass(struct cached_dev *dc, struct bio *bio)
 		goto skip;
 
 	if (mode == CACHE_MODE_NONE ||
-	    (mode == CACHE_MODE_WRITEAROUND &&
+	    ((mode == CACHE_MODE_WRITEAROUND || c->force_write_through == true) &&
 	     op_is_write(bio_op(bio))))
 		goto skip;
 
@@ -410,7 +415,9 @@ static bool check_should_bypass(struct cached_dev *dc, struct bio *bio)
 
 	i = list_first_entry(&dc->io_lru, struct io, lru);
 
+#if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
 	add_sequential(task);
+#endif
 	i->sequential = 0;
 found:
 	if (i->sequential + bio->bi_iter.bi_size > i->sequential)
@@ -418,7 +425,9 @@ found:
 
 	i->last			 = bio_end_sector(bio);
 	i->jiffies		 = jiffies + msecs_to_jiffies(5000);
+#if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
 	task->sequential_io	 = i->sequential;
+#endif
 
 	hlist_del(&i->hash);
 	hlist_add_head(&i->hash, iohash(dc, i->last));
@@ -426,8 +435,12 @@ found:
 
 	spin_unlock(&dc->io_lock);
 
+#if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
 	sectors = max(task->sequential_io,
 		      task->sequential_io_avg) >> 9;
+#else
+	sectors = i->sequential >> 9;
+#endif
 
 	if (dc->sequential_cutoff &&
 	    sectors >= dc->sequential_cutoff >> 9) {
@@ -748,6 +761,10 @@ static void cached_dev_read_done(struct closure *cl)
 	if (s->iop.bio &&
 	    !test_bit(CACHE_SET_STOPPING, &s->iop.c->flags)) {
 		BUG_ON(!s->iop.replace);
+		if ((dc->disk.c->traffic_policy_start == true) &&
+		    (dc->disk.c->force_write_through != true))	{
+			alloc_token(dc, bio_sectors(s->iop.bio));
+		}
 		closure_call(&s->iop.cl, bch_data_insert, NULL, cl);
 	}
 
@@ -862,6 +879,35 @@ static void cached_dev_write_complete(struct closure *cl)
 	cached_dev_bio_complete(cl);
 }
 
+static void alloc_token(struct cached_dev *dc, unsigned sectors)
+{
+	int count = 0;
+
+	spin_lock_bh(&dc->token_lock);
+
+	while ((dc->write_token_sector_size < sectors) &&
+		(dc->write_token_io_num == 0)) {
+		spin_unlock_bh(&dc->token_lock);
+		schedule_timeout_interruptible(msecs_to_jiffies(10));
+		count++;
+		if ((dc->disk.c->traffic_policy_start != true) ||
+		    (cache_mode(dc, NULL) != CACHE_MODE_WRITEBACK) ||
+		    (count > 100))
+			return;
+		spin_lock_bh(&dc->token_lock);
+	}
+
+	if (dc->write_token_sector_size >= sectors)
+		dc->write_token_sector_size -= sectors;
+	else
+		dc->write_token_sector_size = 0;
+
+	if (dc->write_token_io_num > 0)
+		dc->write_token_io_num--;
+
+	spin_unlock_bh(&dc->token_lock);
+}
+
 static void cached_dev_write(struct cached_dev *dc, struct search *s)
 {
 	struct closure *cl = &s->cl;
@@ -973,12 +1019,20 @@ static blk_qc_t cached_dev_make_request(struct request_queue *q,
 					      cached_dev_nodata,
 					      bcache_wq);
 		} else {
+			atomic_inc(&dc->front_io_num);
 			s->iop.bypass = check_should_bypass(dc, bio);
 
-			if (rw)
+			if (rw) {
+				if ((s->iop.bypass == false) &&
+				    (dc->disk.c->traffic_policy_start == true) && 
+				    (cache_mode(dc, bio) == CACHE_MODE_WRITEBACK) &&
+				    (bio_op(bio) != REQ_OP_DISCARD)) {
+					alloc_token(dc, bio_sectors(bio));
+				}
 				cached_dev_write(dc, s);
-			else
+			} else {
 				cached_dev_read(dc, s);
+			}
 		}
 	} else {
 		if ((bio_op(bio) == REQ_OP_DISCARD) &&
@@ -991,11 +1045,70 @@ static blk_qc_t cached_dev_make_request(struct request_queue *q,
 	return BLK_QC_T_NONE;
 }
 
+static int bcache_get_all_status(struct cached_dev* dc, unsigned long arg)
+{
+	struct get_bcache_status a;
+	uint64_t cache_sectors;
+	struct cache_set *c = dc->disk.c;
+
+	if (c == NULL)
+		return -ENODEV;
+
+	a.writeback_sector_size_per_sec = dc->writeback_sector_size_per_sec;
+	a.writeback_io_num_per_sec = dc->writeback_io_num_per_sec;
+	a.front_io_num_per_sec = dc->front_io_num_per_sec;
+	cache_sectors = c->nbuckets * c->sb.bucket_size - bcache_flash_devs_sectors_dirty(c);
+	a.dirty_rate = div64_u64(bcache_dev_sectors_dirty(&dc->disk) * 100, cache_sectors);
+	a.available = 100 - c->gc_stats.in_use;
+	if (copy_to_user((struct get_bcache_status *)arg, &a, sizeof(struct get_bcache_status)))
+		return -EFAULT;
+	return 0;
+}
+
+static int bcache_set_all_status(struct cached_dev* dc, unsigned long arg)
+{
+	struct set_bcache_status a;
+	struct cache_set *c = dc->disk.c;
+
+	if (c== NULL)
+		return -ENODEV;
+	if (copy_from_user(&a, (struct set_bcache_status *)arg, sizeof(struct set_bcache_status)))
+		return -EFAULT;
+
+	if (c->traffic_policy_start != a.traffic_policy_start)
+		pr_info("%s traffic policy %s", dc->disk.disk->disk_name,
+			(a.traffic_policy_start == true) ? "enable" : "disable");
+	if (c->force_write_through != a.force_write_through)
+		pr_info("%s force write through %s", dc->disk.disk->disk_name,
+			(a.force_write_through == true) ? "enable" : "disable");
+	if (a.trigger_gc) {
+		pr_info("trigger %s gc", dc->disk.disk->disk_name);
+		atomic_set(&c->sectors_to_gc, -1);
+		wake_up_gc(c);
+	}
+
+	dc->max_sector_size = a.write_token_sector_size;
+	dc->max_io_num = a.write_token_io_num;
+	c->traffic_policy_start = a.traffic_policy_start;
+	c->force_write_through = a.force_write_through;
+	c->copy_gc_enabled = a.copy_gc_enabled;
+	c->gc_sectors = a.gc_sectors;
+	dc->writeback_state = a.writeback_state;
+	return 0;
+}
+
 static int cached_dev_ioctl(struct bcache_device *d, fmode_t mode,
 			    unsigned int cmd, unsigned long arg)
 {
 	struct cached_dev *dc = container_of(d, struct cached_dev, disk);
-	return __blkdev_driver_ioctl(dc->bdev, mode, cmd, arg);
+	switch (cmd) {
+	case BCACHE_GET_ALL_STATUS:
+		return bcache_get_all_status(dc, arg);
+	case BCACHE_SET_ALL_STATUS:
+		return bcache_set_all_status(dc, arg);
+	default:
+		return __blkdev_driver_ioctl(dc->bdev, mode, cmd, arg);
+	}
 }
 
 static int cached_dev_congested(void *data, int bits)
@@ -1150,4 +1263,31 @@ int __init bch_request_init(void)
 		return -ENOMEM;
 
 	return 0;
+}
+
+static void token_assign(unsigned long data)
+{
+	struct cached_dev *dc = (struct cached_dev *)data;
+
+	dc->token_assign_timer.expires = jiffies + HZ / 8;
+	add_timer(&dc->token_assign_timer);
+
+	spin_lock(&dc->token_lock);
+	dc->write_token_sector_size = dc->max_sector_size / 8;
+	dc->write_token_io_num = dc->max_io_num / 8;
+	dc->write_token_io_num = (dc->write_token_io_num == 0) ? 1 : dc->write_token_io_num;
+	spin_unlock(&dc->token_lock);
+}
+
+void bch_traffic_policy_init(struct cached_dev *dc)
+{
+	spin_lock_init(&dc->token_lock);
+	dc->write_token_sector_size = 0;
+	dc->write_token_io_num = 0;
+
+	init_timer(&dc->token_assign_timer);
+	dc->token_assign_timer.expires = jiffies + HZ / 8;
+	dc->token_assign_timer.data = (unsigned long)dc;
+	dc->token_assign_timer.function = token_assign;
+	add_timer(&dc->token_assign_timer);
 }
