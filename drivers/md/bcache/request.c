@@ -1024,7 +1024,7 @@ static blk_qc_t cached_dev_make_request(struct request_queue *q,
 
 			if (rw) {
 				if ((s->iop.bypass == false) &&
-				    (dc->disk.c->traffic_policy_start == true) && 
+				    (dc->disk.c->traffic_policy_start == true) &&
 				    (cache_mode(dc, bio) == CACHE_MODE_WRITEBACK) &&
 				    (bio_op(bio) != REQ_OP_DISCARD)) {
 					alloc_token(dc, bio_sectors(bio));
