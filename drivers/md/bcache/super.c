@@ -1153,7 +1153,7 @@ static int cached_dev_init(struct cached_dev *dc, unsigned block_size)
 #endif	
 	dc->inflight_block_enable	= 1;
 	dc->read_bypass				= 0;
-	dc->insert_without_placeholder	= 1;
+	dc->insert_without_placeholder	= 0;
 
 	for (io = dc->io; io < dc->io + RECENT_IO; io++) {
 		list_add(&io->lru, &dc->io_lru);

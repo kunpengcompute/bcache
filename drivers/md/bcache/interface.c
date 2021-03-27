@@ -614,7 +614,7 @@ static int inflight_list_remove(struct search *s)
 	return 0;
 }
 
-static bool inflight_list_wait_once(struct search *s)
+static bool inflight_list_wait(struct search *s)
 {
 	struct search *pfs = NULL;
 	struct cached_dev *dc;
@@ -647,6 +647,7 @@ static bool inflight_list_wait_once(struct search *s)
 	return true;
 }
 
+/*
 static bool inflight_list_wait(struct search *s)
 {
 	bool pend = false;
@@ -662,7 +663,7 @@ static bool inflight_list_wait(struct search *s)
 
 	return pend;
 }
-
+*/
 struct inflight_queue_ops inflight_list_ops = {
 	.init	= inflight_list_init,
 	.exit	= inflight_list_exit,
