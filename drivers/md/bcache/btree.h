@@ -228,14 +228,14 @@ struct btree_check_info {
 
 #define BCH_BTR_CHKTHREAD_MAX   64
 struct btree_check_state {
-	struct cache_set*c;
+	struct cache_set* c;
 	int total_threads;
 	int key_idx;
 	spinlock_t idx_lock;
 	atomic_t started;
 	atomic_t enough;
 	wait_queue_head_t wait;
-	struct btree_check_infoinfos[BCH_BTR_CHKTHREAD_MAX];
+	struct btree_check_info infos[BCH_BTR_CHKTHREAD_MAX];
 };
 
 static inline void bch_btree_op_init(struct btree_op *op, int write_lock_level)

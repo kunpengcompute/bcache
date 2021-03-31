@@ -1453,7 +1453,7 @@ static unsigned btree_gc_count_keys(struct btree *b)
 	return ret;
 }
 
-int btree_gc_recurse(struct btree *b, struct btree_op *op,
+static int btree_gc_recurse(struct btree *b, struct btree_op *op,
 			struct closure *writes, struct gc_stat *gc)
 {
 	int ret = 0;
@@ -1816,8 +1816,8 @@ static int bch_btree_check_thread(void *arg)
 
 		while (skip_nr) {
 			k = bch_btree_iter_next_filter(&iter,
-					&c->root->keys,
-					bch_ptr_bad);
+							&c->root->keys,
+							bch_ptr_bad);
 			if (k)
 				p = k;
 			else {
@@ -1828,7 +1828,7 @@ static int bch_btree_check_thread(void *arg)
 				 */
 				atomic_set(&check_state->enough, 1);
 				/* Update check_state->enough earlier */
-				smp_mb__after_atomic();
+				smp_mb;
 				goto out;
 			}
 			skip_nr--;
@@ -1841,7 +1841,7 @@ static int bch_btree_check_thread(void *arg)
 			btree_node_prefetch(c->root, p);
 			c->gc_stats.nodes++;
 			bch_btree_op_init(&op, 0);
-			ret = bcache_btree(check_recurse, p, c->root, &op);
+			ret = btree(check_recurse, p, c->root, &op);
 			if (ret)
 				goto out;
 		}
@@ -1853,7 +1853,7 @@ static int bch_btree_check_thread(void *arg)
 out:
 	info->result = ret;
 	/* update check_state->started among all CPUs */
-	smp_mb__before_atomic();
+	smp_mb();
 	if (atomic_dec_and_test(&check_state->started))
 		wake_up(&check_state->wait);
 
@@ -1910,7 +1910,7 @@ int bch_btree_check(struct cache_set *c)
 	 */
 	for (i = 0; i < check_state->total_threads; i++) {
 		/* fetch latest check_state->enough earlier */
-		smp_mb__before_atomic();
+		smp_mb();
 		if (atomic_read(&check_state->enough))
 			break;
 
@@ -1933,8 +1933,7 @@ int bch_btree_check(struct cache_set *c)
 	}
 
 	wait_event_interruptible(check_state->wait,
-			atomic_read(&check_state->started) == 0 ||
-			test_bit(CACHE_SET_IO_DISABLE, &c->flags));
+			atomic_read(&check_state->started) == 0);
 
 	for (i = 0; i < check_state->total_threads; i++) {
 		if (check_state->infos[i].result) {
@@ -2403,9 +2402,9 @@ int __bch_btree_map_nodes(struct btree_op *op, struct cache_set *c,
 	return btree_root(map_nodes_recurse, c, op, from, fn, flags);
 }
 
-static int bch_btree_map_keys_recurse(struct btree *b, struct btree_op *op,
-				      struct bkey *from, btree_map_keys_fn *fn,
-				      int flags)
+int bch_btree_map_keys_recurse(struct btree *b, struct btree_op *op,
+				struct bkey *from, btree_map_keys_fn *fn,
+				int flags)
 {
 	int ret = MAP_CONTINUE;
 	struct bkey *k;
