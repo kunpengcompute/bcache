@@ -228,7 +228,7 @@ struct btree_check_info {
 
 #define BCH_BTR_CHKTHREAD_MAX   64
 struct btree_check_state {
-	struct cache_set* c;
+	struct cache_set *c;
 	int total_threads;
 	int key_idx;
 	spinlock_t idx_lock;

@@ -1828,7 +1828,7 @@ static int bch_btree_check_thread(void *arg)
 				 */
 				atomic_set(&check_state->enough, 1);
 				/* Update check_state->enough earlier */
-				smp_mb;
+				smp_mb();
 				goto out;
 			}
 			skip_nr--;
