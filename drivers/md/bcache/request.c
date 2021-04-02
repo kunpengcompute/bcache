@@ -936,9 +936,6 @@ static void cached_dev_write_complete(struct closure *cl)
 	}
 
 	continue_at(cl, cached_dev_bio_complete, NULL);
-
-//	up_read_non_owner(&dc->writeback_lock);
-//	cached_dev_bio_complete(cl);
 }
 
 static void cached_dev_write(struct cached_dev *dc, struct search *s)
