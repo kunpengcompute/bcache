@@ -716,6 +716,10 @@ static void cached_dev_bio_complete(struct closure *cl)
 	struct search *s = container_of(cl, struct search, cl);
 	struct cached_dev *dc = container_of(s->d, struct cached_dev, disk);
 
+	if (s->bypass) {
+		up_read_non_owner(&dc->writeback_lock);
+	}
+
 	search_free(cl);
 	cached_dev_put(dc);
 }
@@ -925,8 +929,16 @@ static void cached_dev_write_complete(struct closure *cl)
 	struct search *s = container_of(cl, struct search, cl);
 	struct cached_dev *dc = container_of(s->d, struct cached_dev, disk);
 
-	up_read_non_owner(&dc->writeback_lock);
-	cached_dev_bio_complete(cl);
+	if (s->bypass) {
+		closure_call(&s->iop.cl, bch_data_insert, NULL, cl);
+	} else {
+		up_read_non_owner(&dc->writeback_lock);
+	}
+
+	continue_at(cl, cached_dev_bio_complete, NULL);
+
+//	up_read_non_owner(&dc->writeback_lock);
+//	cached_dev_bio_complete(cl);
 }
 
 static void cached_dev_write(struct cached_dev *dc, struct search *s)
@@ -972,6 +984,8 @@ static void cached_dev_write(struct cached_dev *dc, struct search *s)
 		if ((bio_op(bio) != REQ_OP_DISCARD) ||
 		    blk_queue_discard(bdev_get_queue(dc->bdev)))
 			closure_bio_submit(bio, cl);
+			s->bypass = true;
+			goto skip;
 	} else if (s->iop.writeback) {
 		bch_writeback_add(dc);
 		s->iop.bio = bio;
@@ -995,6 +1009,7 @@ static void cached_dev_write(struct cached_dev *dc, struct search *s)
 	}
 
 	closure_call(&s->iop.cl, bch_data_insert, NULL, cl);
+skip:
 	continue_at(cl, cached_dev_write_complete, NULL);
 }
 

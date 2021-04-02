@@ -72,6 +72,7 @@ struct search {
 	unsigned long		start_time;
 	/* for prefetch, we do not need copy data to bio */
 	bool			prefetch;
+	bool			bypass;
 	struct list_head	list_node;
 	wait_queue_head_t	wqh;
 	struct sample		smp;
