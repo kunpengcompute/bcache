@@ -695,6 +695,7 @@ struct search *search_alloc(struct bio *bio,
 	s->read_dirty_data	= 0;
 	s->start_time		= jiffies;
 	s->prefetch		= prefetch;
+	s->bypass		= false;
 
 	s->iop.c		= d->c;
 	s->iop.bio		= NULL;
