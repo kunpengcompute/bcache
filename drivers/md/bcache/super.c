@@ -67,14 +67,14 @@ LIST_HEAD(bch_cache_sets);
 static LIST_HEAD(uncached_devices);
 
 static int bcache_major;
-static DEFINE_IDA(bcache_minor);
+static DEFINE_IDA(bcache_device_idx);
 static wait_queue_head_t unregister_wait;
 struct workqueue_struct *bcache_wq;
 struct workqueue_struct *bch_journal_wq;
 
 #define BTREE_MAX_PAGES		(256 * 1024 / PAGE_SIZE)
 /* limitation of partitions number on single bcache device */
-#define BCACHE_MINORS		16 /* partition support */
+#define BCACHE_MINORS		128 /* partition support */
 /* limitation of bcache devices number on single system */
 #define BCACHE_DEVICE_IDX_MAX	((1U << MINORBITS)/BCACHE_MINORS)
 
@@ -762,7 +762,8 @@ static void bcache_device_free(struct bcache_device *d)
 	if (d->disk && d->disk->queue)
 		blk_cleanup_queue(d->disk->queue);
 	if (d->disk) {
-		ida_simple_remove(&bcache_minor, first_minor_to_idx(d->disk->first_minor));
+		ida_simple_remove(&bcache_device_idx,
+				  first_minor_to_idx(d->disk->first_minor));
 		put_disk(d->disk);
 	}
 
@@ -806,7 +807,8 @@ static int bcache_device_init(struct bcache_device *d, unsigned block_size,
 	if (!d->full_dirty_stripes)
 		return -ENOMEM;
 
-	idx = ida_simple_get(&bcache_minor, 0, BCACHE_DEVICE_IDX_MAX, GFP_KERNEL);
+	idx = ida_simple_get(&bcache_device_idx, 0,
+				BCACHE_DEVICE_IDX_MAX, GFP_KERNEL);
 	if (idx < 0)
 		return idx;
 
@@ -814,7 +816,8 @@ static int bcache_device_init(struct bcache_device *d, unsigned block_size,
 					   BIOSET_NEED_BVECS |
 					   BIOSET_NEED_RESCUER)) ||
 	    !(d->disk = alloc_disk(BCACHE_MINORS))) {
-		goto err;
+		ida_simple_remove(&bcache_device_idx, idx);
+		return -ENOMEM;
 	}
 
 	set_capacity(d->disk, sectors);
@@ -827,7 +830,7 @@ static int bcache_device_init(struct bcache_device *d, unsigned block_size,
 
 	q = blk_alloc_queue(GFP_KERNEL);
 	if (!q)
-		goto err;
+		return -ENOMEM;
 
 	blk_queue_make_request(q, NULL);
 	d->disk->queue			= q;
@@ -851,10 +854,6 @@ static int bcache_device_init(struct bcache_device *d, unsigned block_size,
 	blk_queue_write_cache(q, true, true);
 
 	return 0;
-
-err:
-	ida_simple_remove(&bcache_minor, idx);
-	return -ENOMEM;
 }
 
 /* Cached device */
