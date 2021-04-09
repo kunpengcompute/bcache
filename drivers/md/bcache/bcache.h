@@ -390,6 +390,13 @@ struct cached_dev {
 	 */
 	atomic_t		has_dirty;
 
+	/*
+	 * Set to zero by things that touch the backing volume-- except
+	 * writeback.  Incremented by writeback.  Used to determine when to
+	 * accelerate idle writeback.
+	 */
+
+	atomic_t		backing_idle;
 #define BCH_CACHE_READA_ALL		0
 #define BCH_CACHE_READA_META_ONLY	1
 	unsigned int		cache_readahead_policy;
