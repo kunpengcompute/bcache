@@ -1089,9 +1089,6 @@ static void detached_dev_do_request(struct bcache_device *d, struct bio *bio)
 	 * which would call closure_get(&dc->disk.cl)
 	 */
 	ddip = kzalloc(sizeof(struct detached_dev_io_private), GFP_NOIO);
-	if (ddip == NULL) {
-		return ;
-	}
 	ddip->d = d;
 	ddip->start_time = jiffies;
 	ddip->bi_end_io = bio->bi_end_io;
