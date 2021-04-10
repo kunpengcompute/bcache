@@ -357,6 +357,12 @@ struct cache_sb_disk {
 	__le64			d[SB_JOURNAL_BUCKETS];	/* journal buckets */
 };
 
+enum stop_on_failure {
+	BCH_CACHED_DEV_STOP_AUTO = 0,
+	BCH_CACHED_DEV_STOP_ALWAYS,
+	BCH_CACHED_DEV_STOP_MODE_MAX,
+};
+
 struct cached_dev {
 	struct list_head	list;
 	struct bcache_device	disk;
@@ -457,6 +463,8 @@ struct cached_dev {
 	unsigned		writeback_rate_i_term_inverse;
 	unsigned		writeback_rate_p_term_inverse;
 	unsigned		writeback_rate_minimum;
+
+	enum stop_on_failure stop_when_cache_set_failed;
 };
 
 enum alloc_reserve {
@@ -1018,6 +1026,7 @@ void bch_write_bdev_super(struct cached_dev *, struct closure *);
 extern struct workqueue_struct *bcache_wq;
 extern struct workqueue_struct *bch_journal_wq;
 extern const char * const bch_cache_modes[];
+extern const char * const bch_stop_on_failure_modes[];
 extern struct mutex bch_register_lock;
 extern struct list_head bch_cache_sets;
 
