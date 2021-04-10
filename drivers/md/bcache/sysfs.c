@@ -101,6 +101,7 @@ rw_attribute(inflight_block_enable);
 rw_attribute(data_csum);
 rw_attribute(cache_mode);
 rw_attribute(readahead_cache_policy);
+rw_attribute(stop_when_cache_set_failed);
 rw_attribute(writeback_metadata);
 rw_attribute(writeback_running);
 rw_attribute(writeback_percent);
@@ -153,6 +154,11 @@ SHOW(__bch_cached_dev)
 		return bch_snprint_string_list(buf, PAGE_SIZE,
 					      bch_reada_cache_policies,
 					      dc->cache_readahead_policy);
+
+	if (attr == &sysfs_stop_when_cache_set_failed)
+		return bch_snprint_string_list(buf, PAGE_SIZE,
+					       bch_stop_on_failure_modes + 1,
+					       dc->stop_when_cache_set_failed);
 
 	sysfs_printf(data_csum,		"%i", dc->disk.data_csum);
 	var_printf(verify,		"%i");
@@ -302,6 +308,15 @@ STORE(__cached_dev)
 			dc->cache_readahead_policy = v;
 	}
 
+	if (attr == &sysfs_stop_when_cache_set_failed) {
+		v = bch_read_string_list(buf, bch_stop_on_failure_modes + 1);
+
+		if (v < 0)
+			return v;
+
+		dc->stop_when_cache_set_failed = v;
+	}
+
 	if (attr == &sysfs_label) {
 		if (size > SB_LABEL_SIZE)
 			return -EINVAL;
@@ -382,6 +397,7 @@ static struct attribute *bch_cached_dev_files[] = {
 #endif
 	&sysfs_cache_mode,
 	&sysfs_readahead_cache_policy,
+	&sysfs_stop_when_cache_set_failed,
 	&sysfs_writeback_metadata,
 	&sysfs_writeback_running,
 	&sysfs_writeback_delay,
