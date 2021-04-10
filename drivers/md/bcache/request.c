@@ -659,6 +659,8 @@ static void backing_request_endio(struct bio *bio)
 
 	if (bio->bi_status) {
 		struct search *s = container_of(cl, struct search, cl);
+		struct cached_dev *dc = container_of(s->d,
+						     struct cached_dev, disk);
 		/*
 		 * If a bio has REQ_PREFLUSH for writeback mode, it is
 		 * speically assembled in cached_dev_write() for a non-zero
@@ -679,6 +681,7 @@ static void backing_request_endio(struct bio *bio)
 		}
 		s->recoverable = false;
 		/* should count I/O error for backing device here */
+		bch_count_backing_io_errors(dc, bio);
 	}
 
 	bio_put(bio);
@@ -1133,9 +1136,14 @@ static void detached_dev_end_io(struct bio *bio)
 	generic_end_io_acct(ddip->d->disk->queue,
 						bio_data_dir(bio),
 						&ddip->d->disk->part0, ddip->start_time);
+	if (bio->bi_status) {
+		struct cached_dev *dc = container_of(ddip->d,
+						     struct cached_dev, disk);
+		/* should count I/O error for backing device here */
+		bch_count_backing_io_errors(dc, bio);
+	}
 
 	kfree(ddip);
-
 	bio->bi_end_io(bio);
 }
 
@@ -1174,7 +1182,8 @@ static blk_qc_t cached_dev_make_request(struct request_queue *q,
 	struct cached_dev *dc = container_of(d, struct cached_dev, disk);
 	int rw = bio_data_dir(bio);
 
-	if (unlikely(d->c && test_bit(CACHE_SET_IO_DISABLE, &d->c->flags))) {
+	if (unlikely((d->c && test_bit(CACHE_SET_IO_DISABLE, &d->c->flags)) ||
+		     dc->io_disable)) {
 		bio->bi_status = BLK_STS_IOERR;
 		bio_endio(bio);
 		return BLK_QC_T_NONE;
