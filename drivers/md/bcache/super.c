@@ -166,7 +166,8 @@ static const char *read_super(struct cache_sb *sb, struct block_device *bdev,
 			goto err;
 
 		err = "Invalid superblock: device too small";
-		if (get_capacity(bdev->bd_disk) < sb->bucket_size * sb->nbuckets)
+		if (get_capacity(bdev->bd_disk) <
+		    sb->bucket_size * sb->nbuckets)
 			goto err;
 
 		err = "Bad UUID";
@@ -615,7 +616,8 @@ static void prio_read(struct cache *ca, uint64_t bucket)
 
 			prio_io(ca, bucket, REQ_OP_READ, 0);
 
-			if (p->csum != bch_crc64(&p->magic, bucket_bytes(ca) - 8))
+			if (p->csum !=
+			    bch_crc64(&p->magic, bucket_bytes(ca) - 8))
 				pr_warn("bad csum reading priorities");
 
 			if (p->magic != pset_magic(&ca->sb))
@@ -1848,7 +1850,9 @@ static void run_cache_set(struct cache_set *c)
 			goto err;
 
 		err = "error reading btree root";
-		c->root = bch_btree_node_get(c, NULL, k, j->btree_level, true, NULL);
+		c->root = bch_btree_node_get(c, NULL, k,
+					     j->btree_level,
+					     true, NULL);
 		if (IS_ERR_OR_NULL(c->root))
 			goto err;
 
@@ -2139,7 +2143,9 @@ static int register_cache(struct cache_sb *sb, struct cache_sb_disk *sb_disk,
 		goto err;
 	}
 
-	if (kobject_add(&ca->kobj, &part_to_dev(bdev->bd_part)->kobj, "bcache")) {
+	if (kobject_add(&ca->kobj,
+			&part_to_dev(bdev->bd_part)->kobj,
+			"bcache")) {
 		err = "error calling kobject_add";
 		ret = -ENOMEM;
 		goto out;
