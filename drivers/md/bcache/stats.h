@@ -36,7 +36,7 @@ struct cache_stats {
 	unsigned long cache_prefetch_fake_hits;
 	unsigned long sectors_bypassed;
 
-	unsigned		rescale;
+	unsigned int		rescale;
 };
 
 struct cache_accounting {
