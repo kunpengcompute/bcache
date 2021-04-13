@@ -892,7 +892,7 @@ static void cached_dev_read_done_bh(struct closure *cl)
 	else
 		bch_mark_cache_accounting(s->iop.c, s->d,
 				  !s->cache_missed, s->iop.bypass);
-	trace_bcache_read(s->orig_bio, !s->cache_miss, s->iop.bypass);
+	trace_bcache_read(s->orig_bio, !s->cache_missed, s->iop.bypass);
 
 	if (!s->prefetch && !s->iop.status) {
 		s->smp.opcode = ACACHE_SAMPLE_LATENCY;
