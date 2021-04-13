@@ -1082,7 +1082,7 @@ void bch_open_buckets_free(struct cache_set *c);
 int bch_cache_allocator_start(struct cache *ca);
 
 void bch_debug_exit(void);
-void bch_debug_init(struct kobject *kobj);
+void bch_debug_init(void);
 void bch_request_exit(void);
 int bch_request_init(void);
 
