@@ -33,7 +33,7 @@ static const char * const bch_reada_cache_policies[] = {
 	NULL
 };
 
-/* Default is -1; we skip past it for struct cached_dev's cache mode */
+/* Default is 0 ("writethrough") */
 static const char * const bch_cache_modes[] = {
 	"writethrough",
 	"writeback",
@@ -42,7 +42,7 @@ static const char * const bch_cache_modes[] = {
 	NULL
 };
 
-/* Default is -1; we skip past it for stop_when_cache_set_failed */
+/* Default is 0 ("auto") */
 static const char * const bch_stop_on_failure_modes[] = {
 	"auto",
 	"always",
