@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * Copyright (C) 2021. Huawei Technologies Co., Ltd.
  * This program is free software; you can redistribute it and/or modify
