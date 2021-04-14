@@ -927,7 +927,7 @@ static int cached_dev_cache_miss(struct btree *b, struct search *s,
 
 	//if called form do_readahead, no need to do this
 	if (!(bio->bi_opf & REQ_RAHEAD) &&
-	    !(bio->bi_opf & REQ_META) &&
+	    !(bio->bi_opf & (REQ_META|REQ_PRIO)) &&
 	    s->iop.c->gc_stats.in_use < CUTOFF_CACHE_READA &&
 	    !s->prefetch)
 		reada = min_t(sector_t, dc->readahead >> 9,
