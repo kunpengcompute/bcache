@@ -347,7 +347,9 @@ STORE(__cached_dev)
 	}
 
 #if defined(CONFIG_BCACHE) || defined(CONFIG_BCACHE_MODULE)
-	d_strtoi_h(sequential_cutoff);
+	sysfs_strtoul_clamp(sequential_cutoff,
+			    dc->sequential_cutoff,
+			    0, UINT_MAX);
 #endif
 
 	sysfs_strtoul_clamp(read_bypass,
