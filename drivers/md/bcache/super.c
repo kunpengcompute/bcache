@@ -2151,6 +2151,12 @@ static int register_cache(struct cache_sb *sb, struct cache_sb_disk *sb_disk,
 
 	ret = cache_alloc(ca);
 	if (ret != 0) {
+		/*
+		 * If we failed here, it means ca->kobj is not initialized yet,
+		 * kobject_put() won't be called and there is no chance to
+		 * call blkdev_put() to bdev in bch_cache_release(). So we
+		 * explicitly call blkdev_put() here.
+		 */
 		blkdev_put(bdev, FMODE_READ|FMODE_WRITE|FMODE_EXCL);
 		if (ret == -ENOMEM)
 			err = "cache_alloc(): -ENOMEM";
@@ -2287,6 +2293,7 @@ static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 			goto err_close;
 
 		mutex_lock(&bch_register_lock);
+		/* blkdev_put() will be called in cached_dev_free() */
 		ret = register_bdev(sb, sb_disk, bdev, dc);
 		mutex_unlock(&bch_register_lock);
 		if (ret < 0)
@@ -2297,6 +2304,7 @@ static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 		if (!ca)
 			goto err_close;
 
+		/* blkdev_put() will be called in bch_cache_release() */
 		if (register_cache(sb, sb_disk, bdev, ca) != 0)
 			goto err;
 	}
