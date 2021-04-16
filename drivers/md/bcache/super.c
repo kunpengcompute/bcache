@@ -1390,9 +1390,7 @@ static int register_bdev(struct cache_sb *sb, struct cache_sb_disk *sb_disk,
 	memcpy(&dc->sb, sb, sizeof(struct cache_sb));
 	dc->bdev = bdev;
 	dc->bdev->bd_holder = dc;
-
 	dc->sb_disk = sb_disk;
-
 
 	if (cached_dev_init(dc, sb->block_size << 9))
 		goto err;
@@ -2234,7 +2232,6 @@ static int register_cache(struct cache_sb *sb, struct cache_sb_disk *sb_disk,
 	memcpy(&ca->sb, sb, sizeof(struct cache_sb));
 	ca->bdev = bdev;
 	ca->bdev->bd_holder = ca;
-
 	ca->sb_disk = sb_disk;
 
 	if (blk_queue_discard(bdev_get_queue(bdev)))
