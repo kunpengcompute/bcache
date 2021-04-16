@@ -2336,7 +2336,7 @@ static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 	const char *err;
 	char *path = NULL;
 	struct cache_sb *sb;
-	struct cache_sb_disk *sb_disk = NULL;
+	struct cache_sb_disk *sb_disk;
 	struct block_device *bdev;
 	ssize_t ret;
 
