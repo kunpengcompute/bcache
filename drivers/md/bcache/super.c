@@ -2337,7 +2337,7 @@ static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 	char *path = NULL;
 	struct cache_sb *sb;
 	struct cache_sb_disk *sb_disk = NULL;
-	struct block_device *bdev = NULL;
+	struct block_device *bdev;
 	ssize_t ret;
 
 	ret = -EBUSY;
@@ -2402,10 +2402,8 @@ static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 		/* blkdev_put() will be called in cached_dev_free() */
 		ret = register_bdev(sb, sb_disk, bdev, dc);
 		mutex_unlock(&bch_register_lock);
-		if (ret < 0) {
-			bdev = NULL;
-			goto out_put_sb_page;
-		}
+		if (ret < 0)
+			goto out_free_sb;
 	} else {
 		struct cache *ca = kzalloc(sizeof(*ca), GFP_KERNEL);
 
@@ -2413,10 +2411,8 @@ static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 			goto out_put_sb_page;
 
 		/* blkdev_put() will be called in bch_cache_release() */
-		if (register_cache(sb, sb_disk, bdev, ca) != 0) {
-			bdev = NULL;
-			goto out_put_sb_page;
-		}
+		if (register_cache(sb, sb_disk, bdev, ca) != 0)
+			goto out_free_sb;
 	}
 
 done:
@@ -2428,8 +2424,7 @@ done:
 out_put_sb_page:
 	put_page(virt_to_page(sb_disk));
 out_blkdev_put:
-	if (bdev)
-		blkdev_put(bdev, FMODE_READ|FMODE_WRITE|FMODE_EXCL);
+	blkdev_put(bdev, FMODE_READ|FMODE_WRITE|FMODE_EXCL);
 out_free_sb:
 	kfree(sb);
 out_free_path:
