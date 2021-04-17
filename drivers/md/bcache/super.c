@@ -893,7 +893,6 @@ static int bcache_device_init(struct bcache_device *d, unsigned int block_size,
 
 	blk_queue_make_request(q, make_request_fn);
 	d->disk->queue			= q;
-	q->queuedata			= d;
 	q->backing_dev_info->congested_data = d;
 	q->limits.max_hw_sectors        = bdevq->limits.max_hw_sectors;
 	q->limits.max_segment_size      = bdevq->limits.max_segment_size;
