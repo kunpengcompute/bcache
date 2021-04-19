@@ -1884,7 +1884,7 @@ struct cache_set *bch_cache_set_alloc(struct cache_sb *sb)
 	if (!c->search)
 		goto err;
 
-	iter_size = (sb->bucket_size / sb->block_size + 1) *
+	iter_size = (meta_bucket_pages(sb) * PAGE_SECTORS / sb->block_size + 1) *
 		sizeof(struct btree_iter_set);
 
 	if (!(c->devices = kzalloc(c->nr_uuids * sizeof(void *), GFP_KERNEL)) ||
