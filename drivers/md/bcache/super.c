@@ -1890,7 +1890,7 @@ struct cache_set *bch_cache_set_alloc(struct cache_sb *sb)
 	if (!(c->devices = kzalloc(c->nr_uuids * sizeof(void *), GFP_KERNEL)) ||
 	    !(c->bio_meta = mempool_create_kmalloc_pool(2,
 				sizeof(struct bbio) + sizeof(struct bio_vec) *
-				bucket_pages(c))) ||
+				meta_bucket_pages(&c->sb))) ||
 	    !(c->fill_iter = mempool_create_kmalloc_pool(1, iter_size)) ||
 	    !(c->bio_split = bioset_create(4, offsetof(struct bbio, bio),
 					   BIOSET_NEED_BVECS |
