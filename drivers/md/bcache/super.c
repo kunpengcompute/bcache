@@ -71,6 +71,29 @@ struct workqueue_struct *bch_journal_wq;
 /* limitation of bcache devices number on single system */
 #define BCACHE_DEVICE_IDX_MAX	((1U << MINORBITS)/BCACHE_MINORS)
 
+#define WITH_FS_DATA_OFFSET 0
+
+int get_sb_offset(char *path, uint64_t *offset)
+{
+	char *p = path;
+
+	while (*p == ' ' && *p != '\0')
+		p++;
+	while (*p != ' ' && *p != '\0')
+		p++;
+	while (*p == ' ' && *p != '\0') {
+		*p = '\0';
+		p++;
+	}
+
+	if (strlen(p) == 0) {
+		*offset = SB_OFFSET;
+		return 0;
+	}
+
+	return kstrtoull(p, 10, offset);
+}
+
 /* Superblock */
 
 static const char *read_super_common(struct cache_sb *sb,  struct block_device *bdev,
@@ -149,7 +172,7 @@ err:
 
 
 static const char *read_super(struct cache_sb *sb, struct block_device *bdev,
-			      struct cache_sb_disk **res)
+			      struct cache_sb_disk **res, uint64_t sb_offset)
 {
 	const char *err;
 	struct cache_sb_disk *s;
@@ -157,10 +180,10 @@ static const char *read_super(struct cache_sb *sb, struct block_device *bdev,
 	unsigned int i;
 
 	page = read_cache_page_gfp(bdev->bd_inode->i_mapping,
-				   SB_OFFSET >> PAGE_SHIFT, GFP_KERNEL);
+				   sb_offset >> PAGE_SHIFT, GFP_KERNEL);
 	if (IS_ERR(page))
  		return "IO error";
-	s = page_address(page) + offset_in_page(SB_OFFSET);
+	s = page_address(page) + offset_in_page(sb_offset);
 
 	sb->offset		= le64_to_cpu(s->offset);
 	sb->version		= le64_to_cpu(s->version);
@@ -182,7 +205,8 @@ static const char *read_super(struct cache_sb *sb, struct block_device *bdev,
 		 sb->version, sb->flags, sb->seq, sb->keys);
 
 	err = "Not a bcache superblock (bad offset)";
-	if (sb->offset != SB_SECTOR)
+	if ((sb->offset != (sb_offset >> 9)) &&
+		(sb->offset != sb_offset))
 		goto err;
 
 	err = "Not a bcache superblock (bad magic)";
@@ -211,7 +235,8 @@ static const char *read_super(struct cache_sb *sb, struct block_device *bdev,
 		sb->data_offset	= le64_to_cpu(s->data_offset);
 
 		err = "Bad data offset";
-		if (sb->data_offset < BDEV_DATA_START_DEFAULT)
+		if ((sb->data_offset < BDEV_DATA_START_DEFAULT) &&
+			sb->data_offset != WITH_FS_DATA_OFFSET)
 			goto err;
 
 		break;
@@ -250,7 +275,7 @@ static void __write_super(struct cache_sb *sb, struct cache_sb_disk *out,
 	unsigned int i;
 
 	bio->bi_opf = REQ_OP_WRITE | REQ_SYNC | REQ_META;
-	bio->bi_iter.bi_sector	= SB_SECTOR;
+	bio->bi_iter.bi_sector	= le64_to_cpu(out->offset) >> SECTOR_SHIFT;
 	bio_add_page(bio, virt_to_page(out), SB_SIZE,
 		offset_in_page(out));
 
@@ -2437,6 +2462,8 @@ static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 	struct block_device *bdev;
 	ssize_t ret;
 	bool async_registration = false;
+	uint64_t sb_offset;
+	int val;
 
 #ifdef CONFIG_BCACHE_ASYNC_REGISTRATION
 	async_registration = true;
@@ -2463,6 +2490,10 @@ static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 	if (!sb)
 		goto out_free_path;
 
+	val = get_sb_offset(path, &sb_offset);
+	if (val)
+		return -EINVAL;
+
 	ret = -EINVAL;
 	err = "failed to open device";
 	bdev = blkdev_get_by_path(strim(path),
@@ -2487,7 +2518,7 @@ static ssize_t register_bcache(struct kobject *k, struct kobj_attribute *attr,
 	if (set_blocksize(bdev, 4096))
 		goto out_blkdev_put;
 
-	err = read_super(sb, bdev, &sb_disk);
+	err = read_super(sb, bdev, &sb_disk, sb_offset);
 	if (err)
 		goto out_blkdev_put;
 
