@@ -1,0 +1,1194 @@
+From a3bdd1f2dc671acbbb5cffe9e2dd9acc2d602667 Mon Sep 17 00:00:00 2001
+From: ponix-j <657511300@qq.com>
+Date: Sat, 29 May 2021 16:26:00 +0800
+Subject: [PATCH] bcache-tools: add a feature for make-bcache within filesystem
+
+---
+ 69-bcache.rules        |   9 +-
+ Makefile               |  17 ++-
+ bcache-register.c      |  44 ++++--
+ bcache-super-show.c    |  46 +++++--
+ bcache.h               |   5 +
+ fs.c                   | 354 +++++++++++++++++++++++++++++++++++++++++++++++++
+ fs.h                   |  46 +++++++
+ get-bcache-super-block | 149 +++++++++++++++++++++
+ make.c                 |  97 ++++++++------
+ probe-bcache.c         |  43 ++++--
+ 10 files changed, 730 insertions(+), 80 deletions(-)
+ create mode 100644 fs.c
+ create mode 100644 fs.h
+ create mode 100644 get-bcache-super-block
+
+diff --git a/69-bcache.rules b/69-bcache.rules
+index 9cc7f0d..f4c4a69 100644
+--- a/69-bcache.rules
++++ b/69-bcache.rules
+@@ -9,17 +9,20 @@ KERNEL=="fd*|sr*", GOTO="bcache_end"
+ # blkid was run by the standard udev rules
+ # It recognised bcache (util-linux 2.24+)
+ ENV{ID_FS_TYPE}=="bcache", GOTO="bcache_backing_found"
++# It recognised ext or xfs
++ENV{ID_FS_TYPE}=="ext[2-4]|xfs", ENV{KEEP_FS}="--keep-fs",GOTO="probe_bcache"
+ # It recognised something else; bail
+-ENV{ID_FS_TYPE}=="?*", GOTO="bcache_backing_end"
++ENV{ID_FS_TYPE}=="?*",  ENV{KEEP_FS}="not-keep-fs", GOTO="probe_bcache"
+ 
++LABEL="probe_bcache"
+ # Backing devices: scan, symlink, register
+-IMPORT{program}="probe-bcache -o udev $tempnode"
++IMPORT{program}="probe-bcache -o udev $tempnode $env{KEEP_FS}"
+ ENV{ID_FS_TYPE}!="bcache", GOTO="bcache_backing_end"
+ ENV{ID_FS_UUID_ENC}=="?*", SYMLINK+="disk/by-uuid/$env{ID_FS_UUID_ENC}"
+ 
+ LABEL="bcache_backing_found"
+ RUN{builtin}+="kmod load bcache"
+-RUN+="bcache-register $tempnode"
++RUN+="bcache-register $tempnode $env{BCACHE_SB_OFFSET}"
+ LABEL="bcache_backing_end"
+ 
+ # Cached devices: symlink
+diff --git a/Makefile b/Makefile
+index 4359866..dc35db2 100644
+--- a/Makefile
++++ b/Makefile
+@@ -9,7 +9,7 @@ all: make-bcache probe-bcache bcache-super-show bcache-register bcache
+ 
+ install: make-bcache probe-bcache bcache-super-show
+ 	$(INSTALL) -m0755 make-bcache bcache-super-show	bcache $(DESTDIR)${PREFIX}/sbin/
+-	$(INSTALL) -m0755 probe-bcache bcache-register		$(DESTDIR)$(UDEVLIBDIR)/
++	$(INSTALL) -m0755 probe-bcache bcache-register get-bcache-super-block $(DESTDIR)$(UDEVLIBDIR)/
+ 	$(INSTALL) -m0644 69-bcache.rules	$(DESTDIR)$(UDEVLIBDIR)/rules.d/
+ 	$(INSTALL) -m0644 -- *.8 $(DESTDIR)${PREFIX}/share/man/man8/
+ 	$(INSTALL) -D -m0755 initramfs/hook	$(DESTDIR)/usr/share/initramfs-tools/hooks/bcache
+@@ -24,18 +24,21 @@ bcache-test: LDLIBS += `pkg-config --libs openssl` -lm
+ 
+ make-bcache: LDLIBS += `pkg-config --libs uuid blkid smartcols`
+ make-bcache: CFLAGS += `pkg-config --cflags uuid blkid smartcols`
+-make-bcache: make.o crc64.o lib.o
++make-bcache: make.o crc64.o lib.o fs.o
+ 
+ probe-bcache: LDLIBS += `pkg-config --libs uuid blkid`
+ probe-bcache: CFLAGS += `pkg-config --cflags uuid blkid`
++probe-bcache: fs.o
+ 
+-bcache-super-show: LDLIBS += `pkg-config --libs uuid`
+-bcache-super-show: CFLAGS += -std=gnu99
+-bcache-super-show: crc64.o
++bcache-super-show: LDLIBS += `pkg-config --libs uuid blkid`
++bcache-super-show: CFLAGS += `pkg-config --cflags blkid` -std=gnu99
++bcache-super-show: crc64.o fs.o
+ 
+-bcache-register: bcache-register.o
++bcache-register: LDLIBS += `pkg-config --libs uuid blkid`
++bcache-register: CFLAGS += `pkg-config --cflags uuid blkid`
++bcache-register: bcache-register.o fs.o
+ 
+ bcache: CFLAGS += `pkg-config --cflags blkid uuid smartcols`
+ bcache: LDLIBS += `pkg-config --libs blkid uuid smartcols`
+ bcache: CFLAGS += -std=gnu99
+-bcache: crc64.o lib.o make.o
++bcache: crc64.o lib.o make.o fs.o
+diff --git a/bcache-register.c b/bcache-register.c
+index ae3a2ba..5119334 100644
+--- a/bcache-register.c
++++ b/bcache-register.c
+@@ -7,31 +7,57 @@
+ #include <stdio.h>
+ #include <unistd.h>
+ #include <fcntl.h>
++#include <string.h>
++
++#include "fs.h"
++
++#define DEV_NAME	1
++#define KEEP_FS		2
++#define MAX_ARG_NUM	3
+ 
+ int main(int argc, char *argv[])
+ {
++    int ret = 0;
+     int fd;
++    int lock_fd;
+ 
+-    if (argc != 2)
+-    {
+-        fprintf(stderr, "bcache-register takes exactly one argument\n");
++    if ((argc < KEEP_FS) || (argc > MAX_ARG_NUM)) {
++        fprintf(stderr, "bcache-register should take two or tree arguments\n");
+         return 1;
+     }
+ 
++    lock_fd = get_file_lock(argv[DEV_NAME], strlen(argv[DEV_NAME]));
++    if (lock_fd == -1)
++        return 1;
++
+     fd = open("/sys/fs/bcache/register", O_WRONLY);
+     if (fd < 0)
+     {
+         perror("Error opening /sys/fs/bcache/register");
+         fprintf(stderr, "The bcache kernel module must be loaded\n");
+-        return 1;
++        ret = 1;
++        goto out;
+     }
+ 
+-    if (dprintf(fd, "%s\n", argv[1]) < 0)
+-    {
+-        fprintf(stderr, "Error registering %s with bcache: %m\n", argv[1]);
+-        return 1;
++    if (argc == MAX_ARG_NUM) {
++        if (dprintf(fd, "%s %s\n", argv[DEV_NAME], argv[KEEP_FS]) < 0) {
++            fprintf(stderr, "Error registering %s %s with bcache: %m\n",
++                    argv[DEV_NAME], argv[KEEP_FS]);
++            ret = 1;
++            goto out;
++        }
++    } else if (dprintf(fd, "%s\n", argv[DEV_NAME]) < 0) {
++        fprintf(stderr, "Error registering %s with bcache: %m\n",
++                argv[DEV_NAME]);
++        ret = 1;
++        goto out;
+     }
+ 
+-    return 0;
++out:
++    if (fd >= 0)
++        close(fd);
++    put_file_lock(argv[DEV_NAME], strlen(argv[DEV_NAME]), lock_fd);
++
++    return ret;
+ }
+ 
+diff --git a/bcache-super-show.c b/bcache-super-show.c
+index 26cc40e..db25c1c 100644
+--- a/bcache-super-show.c
++++ b/bcache-super-show.c
+@@ -12,8 +12,6 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <inttypes.h>
+-#include <linux/fs.h>
+-#include <stdbool.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -22,14 +20,15 @@
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+-#include <uuid/uuid.h>
+ 
+-#include "bcache.h"
++#include <getopt.h>
++#include "fs.h"
+ 
++#define MAX_ARG_NUM 2
+ 
+ static void usage()
+ {
+-	fprintf(stderr, "Usage: bcache-super-show [-f] <device>\n");
++	fprintf(stderr, "Usage: bcache-super-show [-f] <device> [%s]\n", KEEP_FS_ARG);
+ }
+ 
+ 
+@@ -63,14 +62,27 @@ int main(int argc, char **argv)
+ 	extern char *optarg;
+ 	struct cache_sb sb;
+ 	char uuid[40];
++	bool keep_fs = false;
+ 	uint64_t expected_csum;
+-
+-	while ((o = getopt(argc, argv, "f")) != EOF)
++	uint64_t expect_off = 0;
++	int ret;
++	char *dev;
++	struct option opts[] = {
++		{ "keep-fs",    0,NULL,    'k'},
++		{ NULL,         0,NULL,    0},
++	};
++
++	while ((o = getopt_long(argc, argv,
++			 "fk", opts, NULL)) != -1)
+ 		switch (o) {
+ 			case 'f':
+ 				force_csum = 1;
+ 				break;
+ 
++			case 'k':
++				keep_fs = true;
++				break;
++
+ 			default:
+ 				usage();
+ 				exit(1);
+@@ -79,18 +91,22 @@ int main(int argc, char **argv)
+ 	argv += optind;
+ 	argc -= optind;
+ 
+-	if (argc != 1) {
++	if (argc > MAX_ARG_NUM) {
+ 		usage();
+ 		exit(1);
+ 	}
+ 
+-	int fd = open(argv[0], O_RDONLY);
++	dev = argv[0];
++	int fd = open(dev, O_RDONLY);
+ 	if (fd < 0) {
+-		printf("Can't open dev %s: %s\n", argv[0], strerror(errno));
++		printf("Can't open dev %s: %s\n", dev, strerror(errno));
+ 		exit(2);
+ 	}
+ 
+-	if (pread(fd, &sb, sizeof(sb), SB_START) != sizeof(sb)) {
++	check_non_bcache_super(fd, dev, SUPER_SHOW_WRONG, keep_fs);
++
++	memset(&sb, 0, sizeof(sb));
++	if (read_bch_sb(dev, fd, &sb, keep_fs)) {
+ 		fprintf(stderr, "Couldn't read\n");
+ 		exit(2);
+ 	}
+@@ -104,11 +120,15 @@ int main(int argc, char **argv)
+ 		exit(2);
+ 	}
+ 
++	ret = get_sb_offset(dev, fd, &expect_off, keep_fs);
++	if (ret)
++		exit(2);
++
+ 	printf("sb.first_sector\t\t%" PRIu64, sb.offset);
+-	if (sb.offset == SB_SECTOR) {
++	if (sb.offset == expect_off) {
+ 		printf(" [match]\n");
+ 	} else {
+-		printf(" [expected %ds]\n", SB_SECTOR);
++		printf(" [expected %ds]\n", (int)expect_off);
+ 		fprintf(stderr, "Invalid superblock (bad sector)\n");
+ 		exit(2);
+ 	}
+diff --git a/bcache.h b/bcache.h
+index c83f838..54b6cfb 100644
+--- a/bcache.h
++++ b/bcache.h
+@@ -7,6 +7,9 @@
+ #ifndef _BCACHE_H
+ #define _BCACHE_H
+ 
++#include <blkid.h>
++#include <stdbool.h>
++
+ #define BITMASK(name, type, field, offset, size)		\
+ static inline uint64_t name(const type *k)			\
+ { return (k->field >> offset) & ~(((uint64_t) ~0) << size); }	\
+@@ -34,6 +37,8 @@ static const char bcache_magic[] = {
+ #define BCACHE_SB_VERSION_BDEV_WITH_OFFSET	4
+ #define BCACHE_SB_MAX_VERSION			4
+ 
++#define SECTOR_SHIFT 		9
++
+ #define SB_SECTOR		8
+ #define SB_LABEL_SIZE		32
+ #define SB_JOURNAL_BUCKETS	256U
+diff --git a/fs.c b/fs.c
+new file mode 100644
+index 0000000..ab6218c
+--- /dev/null
++++ b/fs.c
+@@ -0,0 +1,354 @@
++/*
++ * fs feature - bcache super block in fs super block operations
++ *
++ * Copyright (c) Huawei Technologies Co., Ltd. 2021-2021. All rights reserved.
++ */
++
++#include "fs.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <string.h>
++#include <sys/file.h>
++#include <sys/stat.h>
++
++#define DEV_NM_MAX			512
++#define TMP_BUF_SIZE		512
++#define LOCK_FILE_PERMIT	0644
++#define DELAY_TIME			100000 /* 100ms */
++#define DIR_PERMIT			0777
++
++enum err_code {
++	ERR_OK = 0,
++	ERR_CMD,
++	ERR_DEV_BUSY,
++	ERR_NO_SB
++};
++
++static void incorrect_fs_help(int fd, const char *dev, int wrong_type)
++{
++	char *method = NULL;
++	char *msgs[] = {
++		"show bcache super with ",
++		"deploy bcache on it with "
++	};
++
++	if (wrong_type >= WRONG_TYPE_NUM)
++		return;
++
++	method = msgs[wrong_type];
++
++	fprintf(stderr, "Device %s already has a non-bcache superblock, "
++			"%s%s\n", dev, method, KEEP_FS_ARG);
++
++	return;
++}
++
++void check_non_bcache_super(int fd, const char *dev, int wrong_type,
++							bool keep_fs)
++{
++	blkid_probe pr;
++
++	if (!(pr = blkid_new_probe()))
++		exit(EXIT_FAILURE);
++	if (blkid_probe_set_device(pr, fd, 0, 0))
++		exit(EXIT_FAILURE);
++	/* enable ptable probing; superblock probing is enabled by default */
++	if (blkid_probe_enable_partitions(pr, true))
++		exit(EXIT_FAILURE);
++	if (!keep_fs && !blkid_do_probe(pr)) {
++		/* show some help info */
++		incorrect_fs_help(fd, dev, wrong_type);
++		exit(EXIT_FAILURE);
++	}
++
++	return;
++}
++
++static int mkdir_if_not_exist(const char *dir)
++{
++	int ret;
++
++	if ((strlen(dir) != 0) && (access(dir, 0) != 0)) {
++		ret = mkdir(dir, DIR_PERMIT);
++		if (ret < 0) {
++			fprintf(stderr, "mkdir %s failed\n", dir);
++			return -1;
++		}
++	}
++
++	return 0;
++}
++
++static int mkdirs(const char *muldir)
++{
++	int i;
++	int len;
++	int ret;
++	char str[DEV_NM_MAX];
++
++	strncpy(str, muldir, DEV_NM_MAX);
++	len = strlen(str);
++	for (i = 0; i < len; i++) {
++		if (str[i] == '/') {
++			str[i] = '\0';
++			ret = mkdir_if_not_exist(str);
++			if (ret == -1) {
++				return -1;
++			}
++			str[i] = '/';
++		}
++	}
++
++	if ((len > 0) && (access(str, 0) != 0)) {
++		ret = mkdir(str, DIR_PERMIT);
++		if (ret < 0) {
++			fprintf(stderr, "mkdir %s failed\n", str);
++			return -1;
++		}
++	}
++
++	return 0;
++}
++
++static int create_file_lock_dir(const char *lock_file, int len)
++{
++	char dir[DEV_NM_MAX] = {0};
++	char *dir_end = NULL;
++
++	if (len >= DEV_NM_MAX)
++		return -1;
++
++	strncpy(dir, lock_file, DEV_NM_MAX - 1);
++
++	dir_end = strrchr(dir, '/');
++	if (dir_end == NULL) {
++		printf("get dir error\n");
++		return -1;
++	}
++	*dir_end = 0;
++
++	return mkdirs(dir);
++}
++
++void put_file_lock(const char *dev, int len, int fd)
++{
++	char lock_file[DEV_NM_MAX] = {0};
++
++	if (len >= DEV_NM_MAX)
++		return;
++
++	if (fd == -1)
++		return;
++
++	snprintf(lock_file, DEV_NM_MAX - 1, "%s%s", BCH_SB_LOCKFILE_DIR, dev);
++
++	flock(fd, LOCK_UN);
++	close(fd);
++	remove(lock_file);
++}
++
++int get_file_lock(const char *dev, int len)
++{
++	int ret;
++	int lock_fd = -1;
++	char lock_file[DEV_NM_MAX] = {0};
++	int count;
++
++	if (dev == NULL)
++		return -1;
++
++	if (len >= DEV_NM_MAX)
++		return -1;
++
++	snprintf(lock_file, DEV_NM_MAX - 1, "%s%s", BCH_SB_LOCKFILE_DIR, dev);
++
++	ret = create_file_lock_dir(lock_file, strlen(lock_file));
++	if (ret == -1)
++		return ret;
++
++	count = 0x1;
++	do {
++		lock_fd = open(lock_file, O_RDWR | O_CREAT, LOCK_FILE_PERMIT);
++		if (lock_fd == -1)
++			usleep(DELAY_TIME);
++
++		if (count > 0x5) {
++			printf("open lock file %s failed\n", lock_file);
++			put_file_lock(dev, len, lock_fd);
++			return -1;
++		}
++		count++;
++	} while (lock_fd == -1);
++
++	count = 0x1;
++	do {
++		ret = flock(lock_fd, LOCK_EX | LOCK_NB);
++		if (ret == -1)
++			sleep(0x1);
++
++		if (count > 0x5) {
++			printf("flock failed\n");
++			put_file_lock(dev, len, lock_fd);
++			return -1;
++		}
++		count++;
++	} while (ret == -1);
++
++	return lock_fd;
++}
++
++static void print_err_info(int ret, const char *dev)
++{
++	switch (ret) {
++		case ERR_CMD:
++			printf("Cmd argument error\n");
++			break;
++		case ERR_DEV_BUSY:
++			printf("Can't open dev %s: Device or resource busy\n", dev);
++			break;
++		case ERR_NO_SB:
++			printf("Dev %s no super block file\n", dev);
++			break;
++		default:
++			break;
++	}
++}
++
++static FILE *run_get_off_len_cmd(const char *dev, bool init_sb_file)
++{
++	FILE *fstream = NULL;
++	char cmd[TMP_BUF_SIZE];
++	char *mk_bch = NULL;
++
++	if (init_sb_file)
++		mk_bch = BCH_SB_FILE_CREATE;
++	else
++		mk_bch = "not_" BCH_SB_FILE_CREATE;
++
++	snprintf(cmd, TMP_BUF_SIZE, "%s %s %s%s %s %u %s", BCH_SB_FILE_SH, dev,
++			BCH_SB_FILE_DIR, dev, BCH_SB_FILE_NAME, BCH_SB_FILE_SIZE, mk_bch);
++
++	fstream = popen(cmd, "r");
++	if (fstream == NULL) {
++		fprintf(stderr, "Execute command failed: %s\n", cmd);
++		return NULL;
++	}
++
++	return fstream;
++}
++
++static int get_bch_sb_file_off_len(const char *dev, uint64_t *offset,
++		uint32_t *length, bool init_sb_file)
++{
++	FILE *fstream = NULL;
++	char buff[TMP_BUF_SIZE];
++	char off_s[TMP_BUF_SIZE];
++	char len_s[TMP_BUF_SIZE];
++	char ret_s[TMP_BUF_SIZE];
++	uint64_t off = 0;
++	uint32_t len = 0;
++	uint32_t ret = 1;
++
++	fstream = run_get_off_len_cmd(dev, init_sb_file);
++	if (fstream == NULL)
++		return -1;
++
++	memset(buff, 0, TMP_BUF_SIZE);
++	while (NULL != fgets(buff, TMP_BUF_SIZE, fstream)) {
++		sscanf(buff, "%s %llu %s %u %s %u", off_s,
++			(long long unsigned int *)&off,
++			len_s, &len, ret_s, &ret);
++		if (!strncmp(off_s, BCH_SB_FILE_OFF_KEY, strlen(BCH_SB_FILE_OFF_KEY)) && !
++			strncmp(ret_s, BCH_SB_FILE_RET_KEY, strlen(BCH_SB_FILE_RET_KEY)) && !
++			strncmp(len_s, BCH_SB_FILE_LEN_KEY, strlen(BCH_SB_FILE_LEN_KEY))) {
++			break;
++		}
++		memset(buff, 0, TMP_BUF_SIZE);
++	}
++	pclose(fstream);
++
++	if (ret != 0) {
++		print_err_info(ret, dev);
++		return ret;
++	}
++
++	*offset = off;
++	*length = len;
++
++	return 0;
++}
++
++int create_bch_sb_file(const char *dev)
++{
++	uint64_t offset = 0;
++	uint32_t length = 0;
++	int ret;
++
++	ret = get_bch_sb_file_off_len(dev, &offset, &length, true);
++	if (ret)
++		return -1;
++
++	return 0;
++}
++
++int get_sb_offset(const char *dev, int fd, uint64_t *offset, bool keep_fs)
++{
++	ssize_t len;
++	uint64_t file_offset = 0;
++	uint32_t file_len = 0;
++	int ret;
++	char buf[BCH_SB_MAGIC_SIZE];
++
++	if (!keep_fs) {
++		*offset = SB_SECTOR;
++		return 0;
++	}
++
++	ret = get_bch_sb_file_off_len(dev, &file_offset, &file_len, false);
++	if (ret)
++		return -1;
++
++	if (file_len != BCH_SB_FILE_SIZE) {
++		printf("bcache super block length not equal to %d\n", BCH_SB_FILE_SIZE);
++		return -1;
++	}
++
++	len = pread(fd, buf, BCH_SB_MAGIC_SIZE, file_offset);
++	if (len != BCH_SB_MAGIC_SIZE) {
++		perror("read sb offset error");
++		return -1;
++	}
++
++	if (memcmp(buf, bcache_magic, BCH_SB_MAGIC_SIZE)) {
++		printf("Not a bcache super\n");
++		return -1;
++	}
++
++	*offset = (file_offset + BCH_SB_FILE_VERIFY_SIZE) >> SECTOR_SHIFT;
++	return 0;
++}
++
++int read_bch_sb(const char *dev, int fd, struct cache_sb *sb, bool keep_fs)
++{
++	ssize_t len;
++	ssize_t read_len;
++	uint64_t sb_offset = 0;
++	int ret;
++
++	ret = get_sb_offset(dev, fd, &sb_offset, keep_fs);
++	if (ret)
++		return ret;
++
++	read_len = sizeof(struct cache_sb);
++
++	len = pread(fd, sb, read_len, (sb_offset << SECTOR_SHIFT));
++	if (len != read_len) {
++		perror("read sb error");
++		return -1;
++	}
++	sb->offset = sb_offset;
++
++	return 0;
++}
+diff --git a/fs.h b/fs.h
+new file mode 100644
+index 0000000..4f8edc9
+--- /dev/null
++++ b/fs.h
+@@ -0,0 +1,46 @@
++/*
++ * fs head - fs structure and macro definition
++ *
++ * Copyright (c) Huawei Technologies Co., Ltd. 2021-2021. All rights reserved.
++ */
++
++#ifndef _FS_H
++#define _FS_H
++
++#include "bcache.h"
++
++#include <uuid/uuid.h>
++#include <linux/fs.h>
++
++#define BCH_SB_LOCKFILE_DIR	"/tmp/bch_sb"
++#define BCH_SB_FILE_DIR		"/mnt/bch_sb"
++#define BCH_SB_FILE_NAME	".bcache_super_block"
++#define BCH_SB_FILE_SH		"sh /lib/udev/get-bcache-super-block"
++#define BCH_SB_FILE_OFF_KEY	"physical_offset"
++#define BCH_SB_FILE_LEN_KEY	"length"
++#define BCH_SB_FILE_RET_KEY	"return"
++#define KEEP_FS_ARG			"--keep-fs"
++#define BCH_SB_FILE_CREATE	"create_bch_sb_file"
++#define BCH_SB_MAGIC_SIZE	16			// sizeof(bcache_magic)
++#define BCH_SB_FILE_SIZE	8192
++#define BCH_SB_FILE_VERIFY_SIZE	4096
++
++#define WITH_FS_DATA_OFFSET	0
++
++enum wrong_fs_type {
++	SUPER_SHOW_WRONG,
++	MAKE_BCACHE_WRONG,
++	WRONG_TYPE_NUM
++};
++
++#define FS_WRONG_NUM 2
++
++int get_sb_offset(const char *dev, int fd, uint64_t *offset, bool keep_fs);
++void check_non_bcache_super(int fd, const char *dev, int wrong_type,
++							bool keep_fs);
++int read_bch_sb(const char *dev, int fd, struct cache_sb *sb, bool keep_fs);
++int create_bch_sb_file(const char *dev);
++int get_file_lock(const char *dev, int len);
++void put_file_lock(const char *dev, int len, int fd);
++
++#endif
+diff --git a/get-bcache-super-block b/get-bcache-super-block
+new file mode 100644
+index 0000000..f187482
+--- /dev/null
++++ b/get-bcache-super-block
+@@ -0,0 +1,149 @@
++#!/bin/sh
++
++dev_name=$1
++mount_dir=$2
++file_name=${mount_dir}/$3
++file_len=$4
++creat_sb_file=$5
++mount_root=`echo ${mount_dir:0:5}`
++dev_root=`echo ${dev_name:0:5}`
++
++# magic, same as bcache super block magic
++w_magic="\xc6\x85\x73\xf6\x4e\x1a\x45\xca\x82\x65\xf5\x7f\x48\xba\x6d\x81"
++r_magic="0000000 85c6 f673 1a4e ca45 6582 7ff5 ba48 816d"
++
++get_phy_off()
++{
++    /usr/sbin/filefrag -vs -b1 $1 | \
++        grep "\.\." | awk -F":" '{print $3}' | awk -F"." '{print $1}' | \
++        awk -F" " '{print $1}'
++}
++
++get_phy_len()
++{
++    /usr/sbin/filefrag -vs -b1 $1 | \
++        grep "\.\." | awk -F":" '{print $4}' | awk -F"." '{print $0}' | \
++        awk -F" " '{print $1}'
++}
++
++print_result()
++{
++    if [ $2 == "0" ]; then
++        physical_offset=`get_phy_off $1`
++        length=`get_phy_len $1`
++    else
++        physical_offset=0
++        length=0
++    fi
++    echo physical_offset ${physical_offset} length ${length} "return" $2
++}
++
++clear_mount_point()
++{
++    umount $1
++    if [ $? == "0" ]; then
++        rm -rf $2
++    fi
++}
++
++create_sb_file()
++{
++    dd if=/dev/zero of=$1 bs=1 count=$2 2>&1
++    chattr +i $1
++    physical_offset=`get_phy_off $1`
++    echo -e -n $3 | dd of=$4 seek=${physical_offset} bs=1 count=16 2>&1
++}
++
++# usage
++if [ $# -lt "5" ]; then
++    echo error: need 5 argument
++    echo Usage:
++    echo "      "$0 dev dir file len create
++    print_result ${file_name} "1"
++    exit 1
++fi
++
++if [ "${mount_root}" != "/mnt/" ]; then
++    echo mount root ${mount_root} error
++    print_result ${file_name} "1"
++    exit 1
++fi
++
++if [ "${dev_root}" != "/dev/" ]; then
++    echo dev root ${dev_root} error
++    print_result ${file_name} "1"
++    exit 1
++fi
++
++if [ -h "${file_name}" ]; then
++    echo ${file_name} is a link file
++    print_result ${file_name} "1"
++    exit 1
++fi
++
++if [ "${file_len}" != "8192" ]; then
++    echo file length ${file_len} error
++    print_result ${file_name} "1"
++    exit 1
++fi
++
++# umount dev
++grep -w ${dev_name} /proc/mounts
++while [ $? == "0" ]; do
++    umount ${dev_name}
++    grep -w ${dev_name} /proc/mounts
++done
++
++# umount mount_root
++grep -w ${mount_root} /proc/mounts | grep -v "${mount_root}/"
++while [ $? == "0" ]; do
++    umount ${mount_root}
++    grep -w ${mount_root} /proc/mounts | grep -v "${mount_root}/"
++done
++
++# create mount point
++if [ ! -d ${mount_dir} ]; then
++    mkdir -p ${mount_dir}
++fi
++
++# mount dev
++mount ${dev_name} ${mount_dir} 2>&1
++if [ "$?" != "0" ]; then
++    echo Dev ${dev_name} is busy
++    print_result ${file_name} "2"
++    exit 2
++fi
++
++if [ "${creat_sb_file}" == "create_bch_sb_file" ]; then
++    if [ ! -f ${file_name} ]; then
++        # create super block file if no super block file
++        create_sb_file ${file_name} ${file_len} ${w_magic} ${dev_name}
++    else
++        # if have super block file, check super block file,
++        # if file not correct, rebuild it
++        physical_offset=`get_phy_off ${file_name}`
++        length=`get_phy_len ${file_name}`
++        l_magic=`dd if=${dev_name} skip=${physical_offset} bs=1 count=16 \
++            2>&1 | hexdump -s 0 -n 16 | awk 'NR==1{print $0}'`
++        if [ "${l_magic}" != "${r_magic}" ] || \
++           [ "${length}" != "${file_len}" ]; then
++            chattr -i ${file_name}
++            rm -rf ${file_name}
++            create_sb_file ${file_name} ${file_len} ${w_magic} ${dev_name}
++        fi
++    fi
++    print_result ${file_name} "0"
++    clear_mount_point ${dev_name} ${mount_dir}
++    exit 0
++else
++    # if not create file command and no super block file, exit error
++    if [ ! -f ${file_name} ]; then
++        echo no super block file
++        print_result ${file_name} "3"
++        clear_mount_point ${dev_name} ${mount_dir}
++        exit 3
++    fi
++fi
++
++print_result ${file_name} "0"
++clear_mount_point ${dev_name} ${mount_dir}
+diff --git a/make.c b/make.c
+index d46d925..3acfde1 100644
+--- a/make.c
++++ b/make.c
+@@ -20,8 +20,6 @@
+ #include <fcntl.h>
+ #include <getopt.h>
+ #include <limits.h>
+-#include <linux/fs.h>
+-#include <stdbool.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -30,9 +28,8 @@
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+-#include <uuid/uuid.h>
+ 
+-#include "bcache.h"
++#include "fs.h"
+ #include "lib.h"
+ #include "bitwise.h"
+ 
+@@ -162,6 +159,7 @@ void usage(void)
+ 	       "	-b, --bucket		bucket size\n"
+ 	       "	-w, --block		block size (hard sector size of SSD, often 2k)\n"
+ 	       "	-o, --data-offset	data offset in sectors\n"
++	       "	-k, --keep-fs		make bcache with filesystem\n"
+ 	       "	    --cset-uuid		UUID for the cache set\n"
+ //	       "	-U			UUID\n"
+ 	       "	    --writeback		enable writeback\n"
+@@ -256,15 +254,27 @@ static void write_sb(char *dev, unsigned int block_size,
+ 			bool writeback, bool discard, bool wipe_bcache,
+ 			unsigned int cache_replacement_policy,
+ 			uint64_t data_offset,
+-			uuid_t set_uuid, bool bdev, bool force, char *label)
++			uuid_t set_uuid, bool bdev, bool force, char *label, bool keep_fs)
+ {
+-	int fd;
++	int fd = -1;
+ 	char uuid_str[40], set_uuid_str[40], zeroes[SB_START] = {0};
+ 	struct cache_sb sb;
+-	blkid_probe pr;
+ 	int write_cdev_super = 1;
++	uint64_t sb_offset;
++	bool bdev_and_keep_fs = bdev && keep_fs;
++	int lock_fd = -1;
++	int open_flag = O_RDWR|O_EXCL;
++
++	if (bdev_and_keep_fs) {
++		lock_fd = get_file_lock(dev, strlen(dev));
++		if (lock_fd == -1)
++			exit(EXIT_FAILURE);
++		if (create_bch_sb_file(dev))
++			exit(EXIT_FAILURE);
++		open_flag = O_RDWR;
++	}
+ 
+-	fd = open(dev, O_RDWR|O_EXCL);
++	fd = open(dev, open_flag);
+ 
+ 	if (fd == -1) {
+ 		if ((errno == 16) && force) {
+@@ -294,7 +304,7 @@ static void write_sb(char *dev, unsigned int block_size,
+ 
+ 			for (i = 0; i < 3; i++) {
+ 				sleep(3);
+-				fd = open(dev, O_RDWR|O_EXCL);
++				fd = open(dev, open_flag);
+ 				if (fd == -1) {
+ 					fprintf(stdout,
+ 						"Waiting for bcache device to be closed.\n");
+@@ -319,13 +329,14 @@ static void write_sb(char *dev, unsigned int block_size,
+ 	if (force)
+ 		wipe_bcache = true;
+ 
+-	if (pread(fd, &sb, sizeof(sb), SB_START) != sizeof(sb))
++	memset(&sb, 0, sizeof(sb));
++	if (read_bch_sb(dev, fd, &sb, bdev_and_keep_fs))
+ 		exit(EXIT_FAILURE);
+ 
+ 	if (!memcmp(sb.magic, bcache_magic, 16)) {
+ 		if (wipe_bcache) {
+ 			if (pwrite(fd, zeroes, sizeof(sb),
+-				SB_START) != sizeof(sb)) {
++				sb.offset << SECTOR_SHIFT) != sizeof(sb)) {
+ 				fprintf(stderr,
+ 					"Failed to erase super block for %s\n",
+ 					dev);
+@@ -338,25 +349,13 @@ static void write_sb(char *dev, unsigned int block_size,
+ 			exit(EXIT_FAILURE);
+ 		}
+ 	}
+-	pr = blkid_new_probe();
+-	if (!pr)
+-		exit(EXIT_FAILURE);
+-	if (blkid_probe_set_device(pr, fd, 0, 0))
+-		exit(EXIT_FAILURE);
+-	/* enable ptable probing; superblock probing is enabled by default */
+-	if (blkid_probe_enable_partitions(pr, true))
+-		exit(EXIT_FAILURE);
+-	if (!blkid_do_probe(pr)) {
+-		/* XXX wipefs doesn't know how to remove partition tables */
+-		fprintf(stderr,
+-			"Device %s already has a non-bcache superblock,", dev);
+-		fprintf(stderr,	"remove it using wipefs and wipefs -a\n");
+-		exit(EXIT_FAILURE);
+-	}
+ 
++	check_non_bcache_super(fd, dev, MAKE_BCACHE_WRONG, bdev_and_keep_fs);
++
++	sb_offset = sb.offset;
+ 	memset(&sb, 0, sizeof(struct cache_sb));
+ 
+-	sb.offset	= SB_SECTOR;
++	sb.offset	= sb_offset;
+ 	sb.version	= bdev
+ 		? BCACHE_SB_VERSION_BDEV
+ 		: BCACHE_SB_VERSION_CDEV;
+@@ -377,6 +376,9 @@ static void write_sb(char *dev, unsigned int block_size,
+ 		SET_BDEV_CACHE_MODE(&sb, writeback ?
+ 			CACHE_MODE_WRITEBACK : CACHE_MODE_WRITETHROUGH);
+ 
++		if (bdev_and_keep_fs)
++			data_offset = WITH_FS_DATA_OFFSET;
++
+ 		if (data_offset != BDEV_DATA_START_DEFAULT) {
+ 			sb.version = BCACHE_SB_VERSION_BDEV_WITH_OFFSET;
+ 			sb.data_offset = data_offset;
+@@ -452,17 +454,29 @@ static void write_sb(char *dev, unsigned int block_size,
+ 
+ 	/* write csum */
+ 	sb.csum = csum_set(&sb);
+-	/* Zero start of disk */
+-	if (pwrite(fd, zeroes, SB_START, 0) != SB_START) {
+-		perror("write error\n");
+-		exit(EXIT_FAILURE);
+-	}
+-	/* Write superblock */
+-	if (pwrite(fd, &sb, sizeof(sb), SB_START) != sizeof(sb)) {
+-		perror("write error\n");
+-		exit(EXIT_FAILURE);
++
++	if (bdev_and_keep_fs) {
++		if (pwrite(fd, &sb, sizeof(sb), (sb.offset << SECTOR_SHIFT)) !=
++			sizeof(sb)) {
++			perror("write sb error");
++			exit(EXIT_FAILURE);
++		}
++	} else {
++		/* Zero start of disk */
++		if (pwrite(fd, zeroes, SB_START, 0) != SB_START) {
++			perror("write error\n");
++			exit(EXIT_FAILURE);
++		}
++		/* Write superblock */
++		if (pwrite(fd, &sb, sizeof(sb), SB_START) != sizeof(sb)) {
++			perror("write error\n");
++			exit(EXIT_FAILURE);
++		}
+ 	}
+ 
++	if (lock_fd != -1)
++		put_file_lock(dev, strlen(dev), lock_fd);
++
+ 	fsync(fd);
+ 	close(fd);
+ }
+@@ -518,6 +532,7 @@ int make_bcache(int argc, char **argv)
+ 	char label[SB_LABEL_SIZE] = { 0 };
+ 	unsigned int block_size = 0, bucket_size = 1024;
+ 	int writeback = 0, discard = 0, wipe_bcache = 0, force = 0;
++	bool keep_fs = false;
+ 	unsigned int cache_replacement_policy = 0;
+ 	uint64_t data_offset = BDEV_DATA_START_DEFAULT;
+ 	uuid_t set_uuid;
+@@ -537,6 +552,7 @@ int make_bcache(int argc, char **argv)
+ 		{ "data_offset",	1, NULL,	'o' },
+ 		{ "data-offset",	1, NULL,	'o' },
+ 		{ "cset-uuid",		1, NULL,	'u' },
++		{ "keep-fs",		0, NULL,	'k' },
+ 		{ "help",		0, NULL,	'h' },
+ 		{ "force",		0, &force,	 1 },
+ 		{ "label",		1, NULL,	 'l' },
+@@ -544,7 +560,7 @@ int make_bcache(int argc, char **argv)
+ 	};
+ 
+ 	while ((c = getopt_long(argc, argv,
+-				"-hCBUo:w:b:l:",
++				"-hCBUko:w:b:l:",
+ 				opts, NULL)) != -1)
+ 		switch (c) {
+ 		case 'C':
+@@ -593,6 +609,9 @@ int make_bcache(int argc, char **argv)
+ 			}
+ 			strcpy(label, optarg);
+ 			break;
++		case 'k':
++			keep_fs = true;
++			break;
+ 		case 'h':
+ 			usage();
+ 			break;
+@@ -634,13 +653,13 @@ int make_bcache(int argc, char **argv)
+ 		write_sb(cache_devices[i], block_size, bucket_size,
+ 			 writeback, discard, wipe_bcache,
+ 			 cache_replacement_policy,
+-			 data_offset, set_uuid, false, force, label);
++			 data_offset, set_uuid, false, force, label, keep_fs);
+ 
+ 	for (i = 0; i < nbacking_devices; i++)
+ 		write_sb(backing_devices[i], block_size, bucket_size,
+ 			 writeback, discard, wipe_bcache,
+ 			 cache_replacement_policy,
+-			 data_offset, set_uuid, true, force, label);
++			 data_offset, set_uuid, true, force, label, keep_fs);
+ 
+ 	return 0;
+ }
+diff --git a/probe-bcache.c b/probe-bcache.c
+index c94c972..ebda93a 100644
+--- a/probe-bcache.c
++++ b/probe-bcache.c
+@@ -8,10 +8,7 @@
+ #define __USE_FILE_OFFSET64
+ #define _XOPEN_SOURCE 500
+ 
+-#include <blkid.h>
+ #include <fcntl.h>
+-#include <linux/fs.h>
+-#include <stdbool.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -20,9 +17,9 @@
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
+-#include <uuid/uuid.h>
+ 
+-#include "bcache.h"
++#include <getopt.h>
++#include "fs.h"
+ 
+ int main(int argc, char **argv)
+ {
+@@ -32,8 +29,16 @@ int main(int argc, char **argv)
+ 	struct cache_sb sb;
+ 	char uuid[40];
+ 	blkid_probe pr;
++	bool keep_fs = false;
++	int ret;
++	int lock_fd;
++	struct option opts[] = {
++		{"keep-fs",	0, NULL,	'k'},
++		{NULL,		0,NULL,		0},
++	};
+ 
+-	while ((o = getopt(argc, argv, "o:")) != EOF)
++	while ((o = getopt_long(argc, argv,
++		"ko:", opts, NULL)) != -1)
+ 		switch (o) {
+ 		case 'o':
+ 			if (strcmp("udev", optarg)) {
+@@ -42,17 +47,31 @@ int main(int argc, char **argv)
+ 			}
+ 			udev = true;
+ 			break;
++
++		case 'k':
++			keep_fs = true;
++			break;
+ 		}
+ 
+ 
+ 	argv += optind;
+ 	argc -= optind;
+ 
++	if (argc == 0)
++		return 1;
++
++	lock_fd = get_file_lock(argv[0], strlen(argv[0]));
++	if (lock_fd == -1)
++		return 1;
++
+ 	for (i = 0; i < argc; i++) {
+ 		int fd = open(argv[i], O_RDONLY);
+ 		if (fd == -1)
+ 			continue;
+ 
++		if (keep_fs && strstr(argv[i], "bcache"))
++			continue;
++
+ 		if (!(pr = blkid_new_probe()))
+ 			continue;
+ 		if (blkid_probe_set_device(pr, fd, 0, 0))
+@@ -62,11 +81,12 @@ int main(int argc, char **argv)
+ 			continue;
+ 		/* bail if anything was found
+ 		 * probe-bcache isn't needed once blkid recognizes bcache */
+-		if (!blkid_do_probe(pr)) {
++		if (!keep_fs && !blkid_do_probe(pr)) {
+ 			continue;
+ 		}
+ 
+-		if (pread(fd, &sb, sizeof(sb), SB_START) != sizeof(sb))
++		ret = read_bch_sb(argv[i], fd, &sb, keep_fs);
++		if (ret != 0)
+ 			continue;
+ 
+ 		if (memcmp(sb.magic, bcache_magic, 16))
+@@ -74,14 +94,19 @@ int main(int argc, char **argv)
+ 
+ 		uuid_unparse(sb.uuid, uuid);
+ 
+-		if (udev)
++		if (udev) {
+ 			printf("ID_FS_UUID=%s\n"
+ 			       "ID_FS_UUID_ENC=%s\n"
+ 			       "ID_FS_TYPE=bcache\n",
+ 			       uuid, uuid);
++			if (keep_fs)
++				printf("BCACHE_SB_OFFSET=%llu\n", (long long unsigned int)sb.offset);
++		}
+ 		else
+ 			printf("%s: UUID=\"\" TYPE=\"bcache\"\n", uuid);
+ 	}
+ 
++	put_file_lock(argv[0], strlen(argv[0]), lock_fd);
++
+ 	return 0;
+ }
+-- 
+1.8.3.1
+
