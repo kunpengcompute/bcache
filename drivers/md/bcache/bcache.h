@@ -216,7 +216,6 @@ BITMASK(GC_MARK,	 struct bucket, gc_mark, 0, 2);
 BITMASK(GC_SECTORS_USED, struct bucket, gc_mark, 2, GC_SECTORS_USED_SIZE);
 BITMASK(GC_MOVE, struct bucket, gc_mark, 15, 1);
 BITMASK(GC_DIRTY_SECTORS, struct bucket, gc_mark, 16, GC_SECTORS_USED_SIZE);
-BITMASK(GC_BUCKET_USED, struct bucket, gc_mark, 29, 1);
 
 #include "journal.h"
 #include "stats.h"
@@ -742,9 +741,11 @@ struct cache_set {
 	unsigned		gc_always_rewrite:1;
 	unsigned		shrinker_disabled:1;
 	unsigned		copy_gc_enabled:1;
+	unsigned		gc_only_dirty_data:1;
 
 #define BUCKET_HASH_BITS	12
 	struct hlist_head	bucket_hash[1 << BUCKET_HASH_BITS];
+	unsigned		cutoff_writeback_sync;
 	bool			traffic_policy_start;
 	bool			force_write_through;
 	unsigned		gc_sectors;
@@ -780,10 +781,11 @@ struct set_bcache_status {
 	bool			trigger_gc;
 	unsigned		writeback_state;
 	unsigned		gc_sectors;
+	unsigned		cutoff_writeback_sync;
 };
 #define BCACHE_MAJOR 'B'
-#define BCACHE_GET_ALL_STATUS _IOR(BCACHE_MAJOR, 0x0, struct get_bcache_status)
-#define BCACHE_SET_ALL_STATUS _IOW(BCACHE_MAJOR, 0x1, struct set_bcache_status)
+#define BCACHE_GET_WRITE_STATUS _IOR(BCACHE_MAJOR, 0x0, struct get_bcache_status)
+#define BCACHE_SET_WRITE_STATUS _IOW(BCACHE_MAJOR, 0x1, struct set_bcache_status)
 
 #define BTREE_PRIO		USHRT_MAX
 #define INITIAL_PRIO		32768U

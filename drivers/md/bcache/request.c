@@ -1045,7 +1045,7 @@ static blk_qc_t cached_dev_make_request(struct request_queue *q,
 	return BLK_QC_T_NONE;
 }
 
-static int bcache_get_all_status(struct cached_dev* dc, unsigned long arg)
+static int bcache_get_write_status(struct cached_dev* dc, unsigned long arg)
 {
 	struct get_bcache_status a;
 	uint64_t cache_sectors;
@@ -1065,7 +1065,7 @@ static int bcache_get_all_status(struct cached_dev* dc, unsigned long arg)
 	return 0;
 }
 
-static int bcache_set_all_status(struct cached_dev* dc, unsigned long arg)
+static int bcache_set_write_status(struct cached_dev* dc, unsigned long arg)
 {
 	struct set_bcache_status a;
 	struct cache_set *c = dc->disk.c;
@@ -1086,12 +1086,15 @@ static int bcache_set_all_status(struct cached_dev* dc, unsigned long arg)
 		atomic_set(&c->sectors_to_gc, -1);
 		wake_up_gc(c);
 	}
+	if ((a.cutoff_writeback_sync >= MIN_CUTOFF_WRITEBACK_SYNC) &&
+		(a.cutoff_writeback_sync <= MAX_CUTOFF_WRITEBACK_SYNC)) {
+		c->cutoff_writeback_sync = a.cutoff_writeback_sync;
+	}
 
 	dc->max_sector_size = a.write_token_sector_size;
 	dc->max_io_num = a.write_token_io_num;
 	c->traffic_policy_start = a.traffic_policy_start;
 	c->force_write_through = a.force_write_through;
-	c->copy_gc_enabled = a.copy_gc_enabled;
 	c->gc_sectors = a.gc_sectors;
 	dc->writeback_state = a.writeback_state;
 	return 0;
@@ -1102,10 +1105,10 @@ static int cached_dev_ioctl(struct bcache_device *d, fmode_t mode,
 {
 	struct cached_dev *dc = container_of(d, struct cached_dev, disk);
 	switch (cmd) {
-	case BCACHE_GET_ALL_STATUS:
-		return bcache_get_all_status(dc, arg);
-	case BCACHE_SET_ALL_STATUS:
-		return bcache_set_all_status(dc, arg);
+	case BCACHE_GET_WRITE_STATUS:
+		return bcache_get_write_status(dc, arg);
+	case BCACHE_SET_WRITE_STATUS:
+		return bcache_set_write_status(dc, arg);
 	default:
 		return __blkdev_driver_ioctl(dc->bdev, mode, cmd, arg);
 	}

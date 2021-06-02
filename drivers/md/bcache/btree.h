@@ -277,7 +277,7 @@ int bch_btree_insert(struct cache_set *, struct keylist *,
 
 int bch_gc_thread_start(struct cache_set *);
 void bch_initial_gc_finish(struct cache_set *);
-void bch_moving_gc(struct cache_set *);
+void bch_moving_gc(struct cache_set *, bool only_move_dirty);
 int bch_btree_check(struct cache_set *);
 void bch_initial_mark_key(struct cache_set *, int, struct bkey *);
 typedef int (btree_map_keys_fn)(struct btree_op *op, struct btree *b,

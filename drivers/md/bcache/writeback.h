@@ -3,7 +3,8 @@
 #define _BCACHE_WRITEBACK_H
 
 #define CUTOFF_WRITEBACK	40
-#define CUTOFF_WRITEBACK_SYNC	85
+#define MIN_CUTOFF_WRITEBACK_SYNC	70
+#define MAX_CUTOFF_WRITEBACK_SYNC	90
 
 static inline uint64_t bcache_dev_sectors_dirty(struct bcache_device *d)
 {
@@ -63,10 +64,11 @@ static inline bool should_writeback(struct cached_dev *dc, struct bio *bio,
 				    unsigned cache_mode, bool would_skip)
 {
 	unsigned in_use = dc->disk.c->gc_stats.in_use;
+	unsigned cutoff = dc->disk.c->cutoff_writeback_sync;
 
 	if (cache_mode != CACHE_MODE_WRITEBACK ||
 	    test_bit(BCACHE_DEV_DETACHING, &dc->disk.flags) ||
-	    in_use > CUTOFF_WRITEBACK_SYNC)
+	    in_use > cutoff)
 		return false;
 
 	if (dc->partial_stripes_expensive &&

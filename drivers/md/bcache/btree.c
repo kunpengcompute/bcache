@@ -1704,7 +1704,7 @@ static void bch_btree_gc(struct cache_set *c)
 
 	trace_bcache_gc_end(c);
 
-	bch_moving_gc(c);
+	bch_moving_gc(c, c->gc_only_dirty_data);
 }
 
 static bool gc_should_run(struct cache_set *c)

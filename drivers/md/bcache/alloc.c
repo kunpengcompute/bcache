@@ -450,7 +450,6 @@ void __bch_bucket_free(struct cache *ca, struct bucket *b)
 	SET_GC_MARK(b, 0);
 	SET_GC_SECTORS_USED(b, 0);
 	SET_GC_DIRTY_SECTORS(b, 0);
-	SET_GC_BUCKET_USED(b, 0);
 }
 
 void bch_bucket_free(struct cache_set *c, struct bkey *k)
