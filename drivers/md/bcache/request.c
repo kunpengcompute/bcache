@@ -329,7 +329,8 @@ void bch_data_insert(struct closure *cl)
 	smp.offset = op->bio->bi_iter.bi_sector;
 	smp.length = op->bio->bi_iter.bi_size;
 	smp.opcode = ACACHE_SAMPLE_CACHE_INSERT;
-	smp.dev = bio_dev(op->bio);
+	if ((op->bio)->bi_disk != NULL)
+		smp.dev = bio_dev(op->bio);
 	smp.start_time = ktime_get_ns();
 	save_circ_item(sample_circ, &smp);
 
