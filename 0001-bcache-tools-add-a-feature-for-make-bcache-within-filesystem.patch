@@ -1,20 +1,20 @@
-From a3bdd1f2dc671acbbb5cffe9e2dd9acc2d602667 Mon Sep 17 00:00:00 2001
+From fcf0d35ba87fc7065e67ca3d44d148d4ea33cc78 Mon Sep 17 00:00:00 2001
 From: ponix-j <657511300@qq.com>
-Date: Sat, 29 May 2021 16:26:00 +0800
-Subject: [PATCH] bcache-tools: add a feature for make-bcache within filesystem
+Date: Fri, 4 Jun 2021 16:43:17 +0800
+Subject: [PATCH] bcache tools: add a feature for make bcache within filesystem
 
 ---
  69-bcache.rules        |   9 +-
- Makefile               |  17 ++-
- bcache-register.c      |  44 ++++--
- bcache-super-show.c    |  46 +++++--
+ Makefile               |  19 +--
+ bcache-register.c      |  48 +++++--
+ bcache-super-show.c    |  44 ++++--
  bcache.h               |   5 +
- fs.c                   | 354 +++++++++++++++++++++++++++++++++++++++++++++++++
- fs.h                   |  46 +++++++
- get-bcache-super-block | 149 +++++++++++++++++++++
- make.c                 |  97 ++++++++------
+ fs.c                   | 314 +++++++++++++++++++++++++++++++++++++++++
+ fs.h                   |  36 +++++
+ get-bcache-super-block | 187 ++++++++++++++++++++++++
+ make.c                 |  98 ++++++++-----
  probe-bcache.c         |  43 ++++--
- 10 files changed, 730 insertions(+), 80 deletions(-)
+ 10 files changed, 730 insertions(+), 73 deletions(-)
  create mode 100644 fs.c
  create mode 100644 fs.h
  create mode 100644 get-bcache-super-block
@@ -48,14 +48,16 @@ index 9cc7f0d..f4c4a69 100644
  
  # Cached devices: symlink
 diff --git a/Makefile b/Makefile
-index 4359866..dc35db2 100644
+index 4359866..40f5641 100644
 --- a/Makefile
 +++ b/Makefile
-@@ -9,7 +9,7 @@ all: make-bcache probe-bcache bcache-super-show bcache-register bcache
+@@ -8,8 +8,8 @@ CFLAGS+=-O2 -Wall -g
+ all: make-bcache probe-bcache bcache-super-show bcache-register bcache
  
  install: make-bcache probe-bcache bcache-super-show
- 	$(INSTALL) -m0755 make-bcache bcache-super-show	bcache $(DESTDIR)${PREFIX}/sbin/
+-	$(INSTALL) -m0755 make-bcache bcache-super-show	bcache $(DESTDIR)${PREFIX}/sbin/
 -	$(INSTALL) -m0755 probe-bcache bcache-register		$(DESTDIR)$(UDEVLIBDIR)/
++	$(INSTALL) -m0755 make-bcache bcache-super-show bcache $(DESTDIR)${PREFIX}/sbin/
 +	$(INSTALL) -m0755 probe-bcache bcache-register get-bcache-super-block $(DESTDIR)$(UDEVLIBDIR)/
  	$(INSTALL) -m0644 69-bcache.rules	$(DESTDIR)$(UDEVLIBDIR)/rules.d/
  	$(INSTALL) -m0644 -- *.8 $(DESTDIR)${PREFIX}/share/man/man8/
@@ -89,10 +91,10 @@ index 4359866..dc35db2 100644
 -bcache: crc64.o lib.o make.o
 +bcache: crc64.o lib.o make.o fs.o
 diff --git a/bcache-register.c b/bcache-register.c
-index ae3a2ba..5119334 100644
+index ae3a2ba..489ae7a 100644
 --- a/bcache-register.c
 +++ b/bcache-register.c
-@@ -7,31 +7,57 @@
+@@ -7,31 +7,63 @@
  #include <stdio.h>
  #include <unistd.h>
  #include <fcntl.h>
@@ -109,18 +111,23 @@ index ae3a2ba..5119334 100644
 +    int ret = 0;
      int fd;
 +    int lock_fd;
++
++    if (argc < KEEP_FS) {
++        fprintf(stderr, "bcache-register takes less than two arguments\n");
++        return 1;
++    }
  
 -    if (argc != 2)
--    {
++    if (argc > MAX_ARG_NUM)
+     {
 -        fprintf(stderr, "bcache-register takes exactly one argument\n");
-+    if ((argc < KEEP_FS) || (argc > MAX_ARG_NUM)) {
-+        fprintf(stderr, "bcache-register should take two or tree arguments\n");
++        fprintf(stderr, "bcache-register takes more than three arguments\n");
          return 1;
      }
  
 +    lock_fd = get_file_lock(argv[DEV_NAME], strlen(argv[DEV_NAME]));
 +    if (lock_fd == -1)
-+        return 1;
++	return 1;
 +
      fd = open("/sys/fs/bcache/register", O_WRONLY);
      if (fd < 0)
@@ -129,7 +136,7 @@ index ae3a2ba..5119334 100644
          fprintf(stderr, "The bcache kernel module must be loaded\n");
 -        return 1;
 +        ret = 1;
-+        goto out;
++	goto out;
      }
  
 -    if (dprintf(fd, "%s\n", argv[1]) < 0)
@@ -160,7 +167,7 @@ index ae3a2ba..5119334 100644
  }
  
 diff --git a/bcache-super-show.c b/bcache-super-show.c
-index 26cc40e..db25c1c 100644
+index 26cc40e..adeb209 100644
 --- a/bcache-super-show.c
 +++ b/bcache-super-show.c
 @@ -12,8 +12,6 @@
@@ -203,8 +210,8 @@ index 26cc40e..db25c1c 100644
 +	int ret;
 +	char *dev;
 +	struct option opts[] = {
-+		{ "keep-fs",    0,NULL,    'k'},
-+		{ NULL,         0,NULL,    0},
++		{ "keep-fs",	0,NULL,		'k'},
++		{ NULL,		0,NULL,		0},
 +	};
 +
 +	while ((o = getopt_long(argc, argv,
@@ -221,7 +228,7 @@ index 26cc40e..db25c1c 100644
  			default:
  				usage();
  				exit(1);
-@@ -79,18 +91,22 @@ int main(int argc, char **argv)
+@@ -79,18 +91,20 @@ int main(int argc, char **argv)
  	argv += optind;
  	argc -= optind;
  
@@ -241,14 +248,12 @@ index 26cc40e..db25c1c 100644
  	}
  
 -	if (pread(fd, &sb, sizeof(sb), SB_START) != sizeof(sb)) {
-+	check_non_bcache_super(fd, dev, SUPER_SHOW_WRONG, keep_fs);
-+
 +	memset(&sb, 0, sizeof(sb));
 +	if (read_bch_sb(dev, fd, &sb, keep_fs)) {
  		fprintf(stderr, "Couldn't read\n");
  		exit(2);
  	}
-@@ -104,11 +120,15 @@ int main(int argc, char **argv)
+@@ -104,11 +118,15 @@ int main(int argc, char **argv)
  		exit(2);
  	}
  
@@ -291,10 +296,10 @@ index c83f838..54b6cfb 100644
  #define SB_JOURNAL_BUCKETS	256U
 diff --git a/fs.c b/fs.c
 new file mode 100644
-index 0000000..ab6218c
+index 0000000..2a3882c
 --- /dev/null
 +++ b/fs.c
-@@ -0,0 +1,354 @@
+@@ -0,0 +1,314 @@
 +/*
 + * fs feature - bcache super block in fs super block operations
 + *
@@ -322,46 +327,6 @@ index 0000000..ab6218c
 +	ERR_DEV_BUSY,
 +	ERR_NO_SB
 +};
-+
-+static void incorrect_fs_help(int fd, const char *dev, int wrong_type)
-+{
-+	char *method = NULL;
-+	char *msgs[] = {
-+		"show bcache super with ",
-+		"deploy bcache on it with "
-+	};
-+
-+	if (wrong_type >= WRONG_TYPE_NUM)
-+		return;
-+
-+	method = msgs[wrong_type];
-+
-+	fprintf(stderr, "Device %s already has a non-bcache superblock, "
-+			"%s%s\n", dev, method, KEEP_FS_ARG);
-+
-+	return;
-+}
-+
-+void check_non_bcache_super(int fd, const char *dev, int wrong_type,
-+							bool keep_fs)
-+{
-+	blkid_probe pr;
-+
-+	if (!(pr = blkid_new_probe()))
-+		exit(EXIT_FAILURE);
-+	if (blkid_probe_set_device(pr, fd, 0, 0))
-+		exit(EXIT_FAILURE);
-+	/* enable ptable probing; superblock probing is enabled by default */
-+	if (blkid_probe_enable_partitions(pr, true))
-+		exit(EXIT_FAILURE);
-+	if (!keep_fs && !blkid_do_probe(pr)) {
-+		/* show some help info */
-+		incorrect_fs_help(fd, dev, wrong_type);
-+		exit(EXIT_FAILURE);
-+	}
-+
-+	return;
-+}
 +
 +static int mkdir_if_not_exist(const char *dir)
 +{
@@ -651,10 +616,10 @@ index 0000000..ab6218c
 +}
 diff --git a/fs.h b/fs.h
 new file mode 100644
-index 0000000..4f8edc9
+index 0000000..d5b7e04
 --- /dev/null
 +++ b/fs.h
-@@ -0,0 +1,46 @@
+@@ -0,0 +1,36 @@
 +/*
 + * fs head - fs structure and macro definition
 + *
@@ -684,17 +649,7 @@ index 0000000..4f8edc9
 +
 +#define WITH_FS_DATA_OFFSET	0
 +
-+enum wrong_fs_type {
-+	SUPER_SHOW_WRONG,
-+	MAKE_BCACHE_WRONG,
-+	WRONG_TYPE_NUM
-+};
-+
-+#define FS_WRONG_NUM 2
-+
 +int get_sb_offset(const char *dev, int fd, uint64_t *offset, bool keep_fs);
-+void check_non_bcache_super(int fd, const char *dev, int wrong_type,
-+							bool keep_fs);
 +int read_bch_sb(const char *dev, int fd, struct cache_sb *sb, bool keep_fs);
 +int create_bch_sb_file(const char *dev);
 +int get_file_lock(const char *dev, int len);
@@ -703,10 +658,10 @@ index 0000000..4f8edc9
 +#endif
 diff --git a/get-bcache-super-block b/get-bcache-super-block
 new file mode 100644
-index 0000000..f187482
+index 0000000..8f122ba
 --- /dev/null
 +++ b/get-bcache-super-block
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,187 @@
 +#!/bin/sh
 +
 +dev_name=$1
@@ -717,9 +672,27 @@ index 0000000..f187482
 +mount_root=`echo ${mount_dir:0:5}`
 +dev_root=`echo ${dev_name:0:5}`
 +
++logname=`echo ${dev_name:5:3}`
++log=/root/log-${logname}.txt
++
 +# magic, same as bcache super block magic
 +w_magic="\xc6\x85\x73\xf6\x4e\x1a\x45\xca\x82\x65\xf5\x7f\x48\xba\x6d\x81"
 +r_magic="0000000 85c6 f673 1a4e ca45 6582 7ff5 ba48 816d"
++
++# this script will be executed by systemd-udevd, if systemd version greater and
++# equal than 239, the systemd-udevd rules SystemCallFilter in configure file
++# /usr/lib/systemd/system/systemd-udevd.service was added, and not config
++# @mount attribute, so the systemd-udevd can not execute mount command,
++# use systemd-mount instead of mount
++systemd_ver=`/usr/lib/systemd/systemd --version | awk 'NR==1{print}' | \
++            awk -F" " '{print $2}'`
++if [ ${systemd_ver} -ge "239" ]; then
++    mount_cmd=systemd-mount
++    umount_cmd=systemd-umount
++else
++    mount_cmd=mount
++    umount_cmd=umount
++fi
 +
 +get_phy_off()
 +{
@@ -749,10 +722,8 @@ index 0000000..f187482
 +
 +clear_mount_point()
 +{
-+    umount $1
-+    if [ $? == "0" ]; then
-+        rm -rf $2
-+    fi
++    ${umount_cmd} $1 2>&1
++    rm -rf $1
 +}
 +
 +create_sb_file()
@@ -799,14 +770,16 @@ index 0000000..f187482
 +# umount dev
 +grep -w ${dev_name} /proc/mounts
 +while [ $? == "0" ]; do
-+    umount ${dev_name}
++    sleep 1
++    ${umount_cmd} ${dev_name}
 +    grep -w ${dev_name} /proc/mounts
 +done
 +
 +# umount mount_root
 +grep -w ${mount_root} /proc/mounts | grep -v "${mount_root}/"
 +while [ $? == "0" ]; do
-+    umount ${mount_root}
++    sleep 1
++    ${umount_cmd} ${mount_root}
 +    grep -w ${mount_root} /proc/mounts | grep -v "${mount_root}/"
 +done
 +
@@ -816,11 +789,31 @@ index 0000000..f187482
 +fi
 +
 +# mount dev
-+mount ${dev_name} ${mount_dir} 2>&1
++mnt_rslt=`${mount_cmd} ${dev_name} ${mount_dir} 2>&1`
 +if [ "$?" != "0" ]; then
-+    echo Dev ${dev_name} is busy
-+    print_result ${file_name} "2"
-+    exit 2
++    key=`echo ${mnt_rslt} | awk -F" " '{print $4,$5}'`
++    # process systemd-mount fail event, start mount service, then
++    # stop mount service, then mount device
++    if [ "${key}" == "transient mount" ]; then
++        service=`echo ${mnt_rslt} | awk -F" " '{print $8}'`
++        systemctl start ${service} 2>&1
++        if [ "$?" != "0" ]; then
++            echo start service ${service} failed
++            print_result ${file_name} "2"
++            exit 2
++        fi
++        systemctl stop ${service} 2>&1
++        ${mount_cmd} ${dev_name} ${mount_dir} 2>&1
++        if [ "$?" != "0" ]; then
++            echo stop service ${service} failed
++            print_result ${file_name} "2"
++            exit 2
++        fi
++    else
++        echo Dev ${dev_name} is busy
++        print_result ${file_name} "2"
++        exit 2
++    fi
 +fi
 +
 +if [ "${creat_sb_file}" == "create_bch_sb_file" ]; then
@@ -842,22 +835,22 @@ index 0000000..f187482
 +        fi
 +    fi
 +    print_result ${file_name} "0"
-+    clear_mount_point ${dev_name} ${mount_dir}
++    clear_mount_point ${mount_dir}
 +    exit 0
 +else
 +    # if not create file command and no super block file, exit error
 +    if [ ! -f ${file_name} ]; then
 +        echo no super block file
 +        print_result ${file_name} "3"
-+        clear_mount_point ${dev_name} ${mount_dir}
++        clear_mount_point ${mount_dir}
 +        exit 3
 +    fi
 +fi
 +
 +print_result ${file_name} "0"
-+clear_mount_point ${dev_name} ${mount_dir}
++clear_mount_point ${mount_dir}
 diff --git a/make.c b/make.c
-index d46d925..3acfde1 100644
+index d46d925..c814c06 100644
 --- a/make.c
 +++ b/make.c
 @@ -20,8 +20,6 @@
@@ -888,7 +881,7 @@ index d46d925..3acfde1 100644
  	       "	    --cset-uuid		UUID for the cache set\n"
  //	       "	-U			UUID\n"
  	       "	    --writeback		enable writeback\n"
-@@ -256,15 +254,27 @@ static void write_sb(char *dev, unsigned int block_size,
+@@ -256,15 +254,28 @@ static void write_sb(char *dev, unsigned int block_size,
  			bool writeback, bool discard, bool wipe_bcache,
  			unsigned int cache_replacement_policy,
  			uint64_t data_offset,
@@ -899,7 +892,7 @@ index d46d925..3acfde1 100644
 +	int fd = -1;
  	char uuid_str[40], set_uuid_str[40], zeroes[SB_START] = {0};
  	struct cache_sb sb;
--	blkid_probe pr;
+ 	blkid_probe pr;
  	int write_cdev_super = 1;
 +	uint64_t sb_offset;
 +	bool bdev_and_keep_fs = bdev && keep_fs;
@@ -920,7 +913,7 @@ index d46d925..3acfde1 100644
  
  	if (fd == -1) {
  		if ((errno == 16) && force) {
-@@ -294,7 +304,7 @@ static void write_sb(char *dev, unsigned int block_size,
+@@ -294,7 +305,7 @@ static void write_sb(char *dev, unsigned int block_size,
  
  			for (i = 0; i < 3; i++) {
  				sleep(3);
@@ -929,7 +922,7 @@ index d46d925..3acfde1 100644
  				if (fd == -1) {
  					fprintf(stdout,
  						"Waiting for bcache device to be closed.\n");
-@@ -319,13 +329,14 @@ static void write_sb(char *dev, unsigned int block_size,
+@@ -319,13 +330,14 @@ static void write_sb(char *dev, unsigned int block_size,
  	if (force)
  		wipe_bcache = true;
  
@@ -946,17 +939,20 @@ index d46d925..3acfde1 100644
  				fprintf(stderr,
  					"Failed to erase super block for %s\n",
  					dev);
-@@ -338,25 +349,13 @@ static void write_sb(char *dev, unsigned int block_size,
+@@ -338,25 +350,27 @@ static void write_sb(char *dev, unsigned int block_size,
  			exit(EXIT_FAILURE);
  		}
  	}
--	pr = blkid_new_probe();
--	if (!pr)
++
+ 	pr = blkid_new_probe();
+ 	if (!pr)
 -		exit(EXIT_FAILURE);
--	if (blkid_probe_set_device(pr, fd, 0, 0))
++			exit(EXIT_FAILURE);
+ 	if (blkid_probe_set_device(pr, fd, 0, 0))
 -		exit(EXIT_FAILURE);
--	/* enable ptable probing; superblock probing is enabled by default */
--	if (blkid_probe_enable_partitions(pr, true))
++			exit(EXIT_FAILURE);
+ 	/* enable ptable probing; superblock probing is enabled by default */
+ 	if (blkid_probe_enable_partitions(pr, true))
 -		exit(EXIT_FAILURE);
 -	if (!blkid_do_probe(pr)) {
 -		/* XXX wipefs doesn't know how to remove partition tables */
@@ -964,10 +960,15 @@ index d46d925..3acfde1 100644
 -			"Device %s already has a non-bcache superblock,", dev);
 -		fprintf(stderr,	"remove it using wipefs and wipefs -a\n");
 -		exit(EXIT_FAILURE);
--	}
++			exit(EXIT_FAILURE);
++	if (!bdev_and_keep_fs && !blkid_do_probe(pr)) {
++			/* XXX wipefs doesn't know how to remove partition tables */
++			fprintf(stderr,
++					"Device %s already has a non-bcache superblock,", dev);
++			fprintf(stderr, "remove it using wipefs and wipefs -a\n");
++			exit(EXIT_FAILURE);
+ 	}
  
-+	check_non_bcache_super(fd, dev, MAKE_BCACHE_WRONG, bdev_and_keep_fs);
-+
 +	sb_offset = sb.offset;
  	memset(&sb, 0, sizeof(struct cache_sb));
  
@@ -976,7 +977,7 @@ index d46d925..3acfde1 100644
  	sb.version	= bdev
  		? BCACHE_SB_VERSION_BDEV
  		: BCACHE_SB_VERSION_CDEV;
-@@ -377,6 +376,9 @@ static void write_sb(char *dev, unsigned int block_size,
+@@ -377,6 +391,9 @@ static void write_sb(char *dev, unsigned int block_size,
  		SET_BDEV_CACHE_MODE(&sb, writeback ?
  			CACHE_MODE_WRITEBACK : CACHE_MODE_WRITETHROUGH);
  
@@ -986,7 +987,7 @@ index d46d925..3acfde1 100644
  		if (data_offset != BDEV_DATA_START_DEFAULT) {
  			sb.version = BCACHE_SB_VERSION_BDEV_WITH_OFFSET;
  			sb.data_offset = data_offset;
-@@ -452,17 +454,29 @@ static void write_sb(char *dev, unsigned int block_size,
+@@ -452,17 +469,29 @@ static void write_sb(char *dev, unsigned int block_size,
  
  	/* write csum */
  	sb.csum = csum_set(&sb);
@@ -1025,7 +1026,7 @@ index d46d925..3acfde1 100644
  	fsync(fd);
  	close(fd);
  }
-@@ -518,6 +532,7 @@ int make_bcache(int argc, char **argv)
+@@ -518,6 +547,7 @@ int make_bcache(int argc, char **argv)
  	char label[SB_LABEL_SIZE] = { 0 };
  	unsigned int block_size = 0, bucket_size = 1024;
  	int writeback = 0, discard = 0, wipe_bcache = 0, force = 0;
@@ -1033,7 +1034,7 @@ index d46d925..3acfde1 100644
  	unsigned int cache_replacement_policy = 0;
  	uint64_t data_offset = BDEV_DATA_START_DEFAULT;
  	uuid_t set_uuid;
-@@ -537,6 +552,7 @@ int make_bcache(int argc, char **argv)
+@@ -537,6 +567,7 @@ int make_bcache(int argc, char **argv)
  		{ "data_offset",	1, NULL,	'o' },
  		{ "data-offset",	1, NULL,	'o' },
  		{ "cset-uuid",		1, NULL,	'u' },
@@ -1041,7 +1042,7 @@ index d46d925..3acfde1 100644
  		{ "help",		0, NULL,	'h' },
  		{ "force",		0, &force,	 1 },
  		{ "label",		1, NULL,	 'l' },
-@@ -544,7 +560,7 @@ int make_bcache(int argc, char **argv)
+@@ -544,7 +575,7 @@ int make_bcache(int argc, char **argv)
  	};
  
  	while ((c = getopt_long(argc, argv,
@@ -1050,7 +1051,7 @@ index d46d925..3acfde1 100644
  				opts, NULL)) != -1)
  		switch (c) {
  		case 'C':
-@@ -593,6 +609,9 @@ int make_bcache(int argc, char **argv)
+@@ -593,6 +624,9 @@ int make_bcache(int argc, char **argv)
  			}
  			strcpy(label, optarg);
  			break;
@@ -1060,7 +1061,7 @@ index d46d925..3acfde1 100644
  		case 'h':
  			usage();
  			break;
-@@ -634,13 +653,13 @@ int make_bcache(int argc, char **argv)
+@@ -634,13 +668,13 @@ int make_bcache(int argc, char **argv)
  		write_sb(cache_devices[i], block_size, bucket_size,
  			 writeback, discard, wipe_bcache,
  			 cache_replacement_policy,
@@ -1190,5 +1191,5 @@ index c94c972..ebda93a 100644
  	return 0;
  }
 -- 
-1.8.3.1
+2.27.0
 
