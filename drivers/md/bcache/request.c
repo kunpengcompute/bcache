@@ -1262,14 +1262,13 @@ blk_qc_t cached_dev_make_request(struct request_queue *q, struct bio *bio)
 			 * we should put this bufer bio_set_dev
 			 * we should not exclue backing dev to user
 			 */
-			if (!s->iop.bypass && bio->bi_iter.bi_size && !rw) {
-				s->smp.offset = bio->bi_iter.bi_sector - dc->sb.data_offset;
-				s->smp.length = bio->bi_iter.bi_size;
-				s->smp.opcode = rw;
-				s->smp.dev = dc->bdev->bd_dev;
-				s->smp.start_time = ktime_get_ns();
+			s->smp.offset = bio->bi_iter.bi_sector - dc->sb.data_offset;
+			s->smp.length = bio->bi_iter.bi_size;
+			s->smp.opcode = rw;
+			s->smp.dev = dc->bdev->bd_dev;
+			s->smp.start_time = ktime_get_ns();
+			if (!s->iop.bypass && bio->bi_iter.bi_size && !rw)
 				save_circ_item(sample_circ, &s->smp);
-			}
 
 			if (rw)
 				cached_dev_write(dc, s);
