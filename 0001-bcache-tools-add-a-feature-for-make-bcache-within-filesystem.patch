@@ -1,26 +1,26 @@
-From fcf0d35ba87fc7065e67ca3d44d148d4ea33cc78 Mon Sep 17 00:00:00 2001
-From: ponix-j <657511300@qq.com>
-Date: Fri, 4 Jun 2021 16:43:17 +0800
-Subject: [PATCH] bcache tools: add a feature for make bcache within filesystem
+From 8a1ee47ab8422f723459ebcae57476b7b6f22a76 Mon Sep 17 00:00:00 2001
+From: root <root@localhost.localdomain>
+Date: Wed, 21 Jul 2021 19:53:09 +0800
+Subject: [PATCH] bcache-tools: add-a-feature-for-make-bcache-within-filesystem
 
 ---
- 69-bcache.rules        |   9 +-
- Makefile               |  19 +--
- bcache-register.c      |  48 +++++--
+ 69-bcache.rules        |   7 +-
+ Makefile               |  34 +++--
+ bcache-register.c      |  44 ++++--
  bcache-super-show.c    |  44 ++++--
  bcache.h               |   5 +
  fs.c                   | 314 +++++++++++++++++++++++++++++++++++++++++
  fs.h                   |  36 +++++
- get-bcache-super-block | 187 ++++++++++++++++++++++++
+ get-bcache-super-block | 159 +++++++++++++++++++++
  make.c                 |  98 ++++++++-----
- probe-bcache.c         |  43 ++++--
- 10 files changed, 730 insertions(+), 73 deletions(-)
+ probe-bcache.c         |  72 ++++++++--
+ 10 files changed, 738 insertions(+), 75 deletions(-)
  create mode 100644 fs.c
  create mode 100644 fs.h
  create mode 100644 get-bcache-super-block
 
 diff --git a/69-bcache.rules b/69-bcache.rules
-index 9cc7f0d..f4c4a69 100644
+index 9cc7f0d..42a179b 100644
 --- a/69-bcache.rules
 +++ b/69-bcache.rules
 @@ -9,17 +9,20 @@ KERNEL=="fd*|sr*", GOTO="bcache_end"
@@ -28,10 +28,9 @@ index 9cc7f0d..f4c4a69 100644
  # It recognised bcache (util-linux 2.24+)
  ENV{ID_FS_TYPE}=="bcache", GOTO="bcache_backing_found"
 +# It recognised ext or xfs
-+ENV{ID_FS_TYPE}=="ext[2-4]|xfs", ENV{KEEP_FS}="--keep-fs",GOTO="probe_bcache"
++ENV{ID_FS_TYPE}=="ext[2-4]|xfs", ENV{KEEP_FS}="--keep-fs", GOTO="probe_bcache"
  # It recognised something else; bail
--ENV{ID_FS_TYPE}=="?*", GOTO="bcache_backing_end"
-+ENV{ID_FS_TYPE}=="?*",  ENV{KEEP_FS}="not-keep-fs", GOTO="probe_bcache"
+ ENV{ID_FS_TYPE}=="?*", GOTO="bcache_backing_end"
  
 +LABEL="probe_bcache"
  # Backing devices: scan, symlink, register
@@ -48,7 +47,7 @@ index 9cc7f0d..f4c4a69 100644
  
  # Cached devices: symlink
 diff --git a/Makefile b/Makefile
-index 4359866..40f5641 100644
+index 4359866..684bd74 100644
 --- a/Makefile
 +++ b/Makefile
 @@ -8,8 +8,8 @@ CFLAGS+=-O2 -Wall -g
@@ -62,7 +61,29 @@ index 4359866..40f5641 100644
  	$(INSTALL) -m0644 69-bcache.rules	$(DESTDIR)$(UDEVLIBDIR)/rules.d/
  	$(INSTALL) -m0644 -- *.8 $(DESTDIR)${PREFIX}/share/man/man8/
  	$(INSTALL) -D -m0755 initramfs/hook	$(DESTDIR)/usr/share/initramfs-tools/hooks/bcache
-@@ -24,18 +24,21 @@ bcache-test: LDLIBS += `pkg-config --libs openssl` -lm
+@@ -17,6 +17,21 @@ install: make-bcache probe-bcache bcache-super-show
+ 	$(INSTALL) -D -m0755 dracut/module-setup.sh $(DESTDIR)$(DRACUTLIBDIR)/modules.d/90bcache/module-setup.sh
+ #	$(INSTALL) -m0755 bcache-test $(DESTDIR)${PREFIX}/sbin/
+ 
++uninstall:
++	$(RM) $(DESTDIR)${PREFIX}/sbin/make-bcache
++	$(RM) $(DESTDIR)${PREFIX}/sbin/bcache-super-show
++	$(RM) $(DESTDIR)${PREFIX}/sbin/bcache
++	$(RM) $(DESTDIR)$(UDEVLIBDIR)/probe-bcache
++	$(RM) $(DESTDIR)$(UDEVLIBDIR)/bcache-register
++	$(RM) $(DESTDIR)$(UDEVLIBDIR)/get-bcache-super-block
++	$(RM) $(DESTDIR)$(UDEVLIBDIR)/rules.d/69-bcache.rules
++	$(RM) $(DESTDIR)${PREFIX}/share/man/man8/bcache-super-show.8
++	$(RM) $(DESTDIR)${PREFIX}/share/man/man8/make-bcache.8
++	$(RM) $(DESTDIR)${PREFIX}/share/man/man8/probe-bcache.8
++	$(RM) $(DESTDIR)/usr/share/initramfs-tools/hooks/bcache/*
++	$(RM) $(DESTDIR)/usr/lib/initcpio/install/bcache/*
++	$(RM) $(DESTDIR)$(DRACUTLIBDIR)/modules.d/90bcache/module-setup.sh
++
+ clean:
+ 	$(RM) -f bcache make-bcache probe-bcache bcache-super-show bcache-register bcache-test -- *.o
+ 
+@@ -24,18 +39,21 @@ bcache-test: LDLIBS += `pkg-config --libs openssl` -lm
  
  make-bcache: LDLIBS += `pkg-config --libs uuid blkid smartcols`
  make-bcache: CFLAGS += `pkg-config --cflags uuid blkid smartcols`
@@ -91,10 +112,10 @@ index 4359866..40f5641 100644
 -bcache: crc64.o lib.o make.o
 +bcache: crc64.o lib.o make.o fs.o
 diff --git a/bcache-register.c b/bcache-register.c
-index ae3a2ba..489ae7a 100644
+index ae3a2ba..5119334 100644
 --- a/bcache-register.c
 +++ b/bcache-register.c
-@@ -7,31 +7,63 @@
+@@ -7,31 +7,57 @@
  #include <stdio.h>
  #include <unistd.h>
  #include <fcntl.h>
@@ -111,23 +132,18 @@ index ae3a2ba..489ae7a 100644
 +    int ret = 0;
      int fd;
 +    int lock_fd;
-+
-+    if (argc < KEEP_FS) {
-+        fprintf(stderr, "bcache-register takes less than two arguments\n");
-+        return 1;
-+    }
  
 -    if (argc != 2)
-+    if (argc > MAX_ARG_NUM)
-     {
+-    {
 -        fprintf(stderr, "bcache-register takes exactly one argument\n");
-+        fprintf(stderr, "bcache-register takes more than three arguments\n");
++    if ((argc < KEEP_FS) || (argc > MAX_ARG_NUM)) {
++        fprintf(stderr, "bcache-register should take two or tree arguments\n");
          return 1;
      }
  
 +    lock_fd = get_file_lock(argv[DEV_NAME], strlen(argv[DEV_NAME]));
 +    if (lock_fd == -1)
-+	return 1;
++        return 1;
 +
      fd = open("/sys/fs/bcache/register", O_WRONLY);
      if (fd < 0)
@@ -136,7 +152,7 @@ index ae3a2ba..489ae7a 100644
          fprintf(stderr, "The bcache kernel module must be loaded\n");
 -        return 1;
 +        ret = 1;
-+	goto out;
++        goto out;
      }
  
 -    if (dprintf(fd, "%s\n", argv[1]) < 0)
@@ -658,10 +674,10 @@ index 0000000..d5b7e04
 +#endif
 diff --git a/get-bcache-super-block b/get-bcache-super-block
 new file mode 100644
-index 0000000..8f122ba
+index 0000000..4e2321f
 --- /dev/null
 +++ b/get-bcache-super-block
-@@ -0,0 +1,187 @@
+@@ -0,0 +1,159 @@
 +#!/bin/sh
 +
 +dev_name=$1
@@ -672,27 +688,9 @@ index 0000000..8f122ba
 +mount_root=`echo ${mount_dir:0:5}`
 +dev_root=`echo ${dev_name:0:5}`
 +
-+logname=`echo ${dev_name:5:3}`
-+log=/root/log-${logname}.txt
-+
 +# magic, same as bcache super block magic
 +w_magic="\xc6\x85\x73\xf6\x4e\x1a\x45\xca\x82\x65\xf5\x7f\x48\xba\x6d\x81"
 +r_magic="0000000 85c6 f673 1a4e ca45 6582 7ff5 ba48 816d"
-+
-+# this script will be executed by systemd-udevd, if systemd version greater and
-+# equal than 239, the systemd-udevd rules SystemCallFilter in configure file
-+# /usr/lib/systemd/system/systemd-udevd.service was added, and not config
-+# @mount attribute, so the systemd-udevd can not execute mount command,
-+# use systemd-mount instead of mount
-+systemd_ver=`/usr/lib/systemd/systemd --version | awk 'NR==1{print}' | \
-+            awk -F" " '{print $2}'`
-+if [ ${systemd_ver} -ge "239" ]; then
-+    mount_cmd=systemd-mount
-+    umount_cmd=systemd-umount
-+else
-+    mount_cmd=mount
-+    umount_cmd=umount
-+fi
 +
 +get_phy_off()
 +{
@@ -708,6 +706,11 @@ index 0000000..8f122ba
 +        awk -F" " '{print $1}'
 +}
 +
++get_dev_uuid()
++{
++    blkid $1 | awk -F"UUID=\"" '{printf $2}' | awk -F"\"" '{printf $1}'
++}
++
 +print_result()
 +{
 +    if [ $2 == "0" ]; then
@@ -720,10 +723,34 @@ index 0000000..8f122ba
 +    echo physical_offset ${physical_offset} length ${length} "return" $2
 +}
 +
-+clear_mount_point()
++clear_mnt_point()
 +{
-+    ${umount_cmd} $1 2>&1
-+    rm -rf $1
++    umount $1
++}
++
++check_mnt_dir()
++{
++    if [ "${mount_root}" != "/mnt/" ]; then
++        echo mount root ${mount_root} error
++        print_result ${file_name} "1"
++        exit 1
++    fi
++}
++
++create_mount_point()
++{
++    if [ ! -d ${mount_dir} ]; then
++        mkdir -p ${mount_dir}
++    fi
++}
++
++mount_dev()
++{
++    mnt_rslt=`mount ${dev_name} ${mount_dir} 2>&1`
++    if [ "$?" != "0" ]; then
++        print_result ${file_name} "2"
++        exit 2
++    fi
 +}
 +
 +create_sb_file()
@@ -731,7 +758,30 @@ index 0000000..8f122ba
 +    dd if=/dev/zero of=$1 bs=1 count=$2 2>&1
 +    chattr +i $1
 +    physical_offset=`get_phy_off $1`
++    dev_uuid=`get_dev_uuid ${dev_name}`
++    if [ ! -f "/usr/lib/udev/${dev_name}" ]; then
++        echo ${physical_offset} > /usr/lib/udev/${dev_uuid}
++    else
++        rm /usr/lib/udev/${dev_uuid}
++        echo ${physical_offset} > /usr/lib/udev/${dev_uuid}
++    fi
 +    echo -e -n $3 | dd of=$4 seek=${physical_offset} bs=1 count=16 2>&1
++}
++
++get_offset()
++{
++    dev=${dev_name:5}
++    dev_uuid=`get_dev_uuid ${dev_name}`
++    if [ ! -f "/usr/lib/udev/${dev_uuid}" ]; then
++        physical_offset=0
++        length=0
++        ret=1
++    else
++        physical_offset=`cat /usr/lib/udev/${dev_uuid}`
++        length=8192
++        ret=0
++    fi
++    echo physical_offset ${physical_offset} length ${length} return ${ret}
 +}
 +
 +# usage
@@ -739,12 +789,6 @@ index 0000000..8f122ba
 +    echo error: need 5 argument
 +    echo Usage:
 +    echo "      "$0 dev dir file len create
-+    print_result ${file_name} "1"
-+    exit 1
-+fi
-+
-+if [ "${mount_root}" != "/mnt/" ]; then
-+    echo mount root ${mount_root} error
 +    print_result ${file_name} "1"
 +    exit 1
 +fi
@@ -767,56 +811,10 @@ index 0000000..8f122ba
 +    exit 1
 +fi
 +
-+# umount dev
-+grep -w ${dev_name} /proc/mounts
-+while [ $? == "0" ]; do
-+    sleep 1
-+    ${umount_cmd} ${dev_name}
-+    grep -w ${dev_name} /proc/mounts
-+done
-+
-+# umount mount_root
-+grep -w ${mount_root} /proc/mounts | grep -v "${mount_root}/"
-+while [ $? == "0" ]; do
-+    sleep 1
-+    ${umount_cmd} ${mount_root}
-+    grep -w ${mount_root} /proc/mounts | grep -v "${mount_root}/"
-+done
-+
-+# create mount point
-+if [ ! -d ${mount_dir} ]; then
-+    mkdir -p ${mount_dir}
-+fi
-+
-+# mount dev
-+mnt_rslt=`${mount_cmd} ${dev_name} ${mount_dir} 2>&1`
-+if [ "$?" != "0" ]; then
-+    key=`echo ${mnt_rslt} | awk -F" " '{print $4,$5}'`
-+    # process systemd-mount fail event, start mount service, then
-+    # stop mount service, then mount device
-+    if [ "${key}" == "transient mount" ]; then
-+        service=`echo ${mnt_rslt} | awk -F" " '{print $8}'`
-+        systemctl start ${service} 2>&1
-+        if [ "$?" != "0" ]; then
-+            echo start service ${service} failed
-+            print_result ${file_name} "2"
-+            exit 2
-+        fi
-+        systemctl stop ${service} 2>&1
-+        ${mount_cmd} ${dev_name} ${mount_dir} 2>&1
-+        if [ "$?" != "0" ]; then
-+            echo stop service ${service} failed
-+            print_result ${file_name} "2"
-+            exit 2
-+        fi
-+    else
-+        echo Dev ${dev_name} is busy
-+        print_result ${file_name} "2"
-+        exit 2
-+    fi
-+fi
-+
 +if [ "${creat_sb_file}" == "create_bch_sb_file" ]; then
++    check_mnt_dir
++    create_mount_point
++    mount_dev
 +    if [ ! -f ${file_name} ]; then
 +        # create super block file if no super block file
 +        create_sb_file ${file_name} ${file_len} ${w_magic} ${dev_name}
@@ -835,22 +833,12 @@ index 0000000..8f122ba
 +        fi
 +    fi
 +    print_result ${file_name} "0"
-+    clear_mount_point ${mount_dir}
-+    exit 0
++    clear_mnt_point ${mount_dir}
 +else
-+    # if not create file command and no super block file, exit error
-+    if [ ! -f ${file_name} ]; then
-+        echo no super block file
-+        print_result ${file_name} "3"
-+        clear_mount_point ${mount_dir}
-+        exit 3
-+    fi
++    get_offset ${dev_name}
 +fi
-+
-+print_result ${file_name} "0"
-+clear_mount_point ${mount_dir}
 diff --git a/make.c b/make.c
-index d46d925..c814c06 100644
+index d46d925..6e6c13f 100644
 --- a/make.c
 +++ b/make.c
 @@ -20,8 +20,6 @@
@@ -987,7 +975,7 @@ index d46d925..c814c06 100644
  		if (data_offset != BDEV_DATA_START_DEFAULT) {
  			sb.version = BCACHE_SB_VERSION_BDEV_WITH_OFFSET;
  			sb.data_offset = data_offset;
-@@ -452,17 +469,29 @@ static void write_sb(char *dev, unsigned int block_size,
+@@ -452,19 +469,31 @@ static void write_sb(char *dev, unsigned int block_size,
  
  	/* write csum */
  	sb.csum = csum_set(&sb);
@@ -1020,12 +1008,14 @@ index d46d925..c814c06 100644
 +		}
  	}
  
-+	if (lock_fd != -1)
-+		put_file_lock(dev, strlen(dev), lock_fd);
-+
  	fsync(fd);
  	close(fd);
++
++	if (lock_fd != -1)
++		put_file_lock(dev, strlen(dev), lock_fd);
  }
+ 
+ static unsigned int get_blocksize(const char *path)
 @@ -518,6 +547,7 @@ int make_bcache(int argc, char **argv)
  	char label[SB_LABEL_SIZE] = { 0 };
  	unsigned int block_size = 0, bucket_size = 1024;
@@ -1078,7 +1068,7 @@ index d46d925..c814c06 100644
  	return 0;
  }
 diff --git a/probe-bcache.c b/probe-bcache.c
-index c94c972..ebda93a 100644
+index c94c972..23ee8c9 100644
 --- a/probe-bcache.c
 +++ b/probe-bcache.c
 @@ -8,10 +8,7 @@
@@ -1104,13 +1094,18 @@ index c94c972..ebda93a 100644
  
  int main(int argc, char **argv)
  {
-@@ -32,8 +29,16 @@ int main(int argc, char **argv)
+@@ -31,9 +28,21 @@ int main(int argc, char **argv)
+ 	extern char *optarg;
  	struct cache_sb sb;
  	char uuid[40];
++	const char* blk_uuid;
  	blkid_probe pr;
 +	bool keep_fs = false;
-+	int ret;
 +	int lock_fd;
++	FILE* fp=NULL;
++	char filepath[60];
++	char offset[100];
++	int sb_offset;
 +	struct option opts[] = {
 +		{"keep-fs",	0, NULL,	'k'},
 +		{NULL,		0,NULL,		0},
@@ -1122,16 +1117,16 @@ index c94c972..ebda93a 100644
  		switch (o) {
  		case 'o':
  			if (strcmp("udev", optarg)) {
-@@ -42,17 +47,31 @@ int main(int argc, char **argv)
+@@ -42,17 +51,30 @@ int main(int argc, char **argv)
  			}
  			udev = true;
  			break;
-+
+-		}
+ 
 +		case 'k':
 +			keep_fs = true;
 +			break;
- 		}
- 
++		}
  
  	argv += optind;
  	argc -= optind;
@@ -1154,22 +1149,45 @@ index c94c972..ebda93a 100644
  		if (!(pr = blkid_new_probe()))
  			continue;
  		if (blkid_probe_set_device(pr, fd, 0, 0))
-@@ -62,11 +81,12 @@ int main(int argc, char **argv)
+@@ -62,11 +84,34 @@ int main(int argc, char **argv)
  			continue;
  		/* bail if anything was found
  		 * probe-bcache isn't needed once blkid recognizes bcache */
 -		if (!blkid_do_probe(pr)) {
-+		if (!keep_fs && !blkid_do_probe(pr)) {
- 			continue;
+-			continue;
++
++		if (keep_fs) {
++			blkid_do_probe(pr);
++			if (blkid_probe_lookup_value(pr, "UUID", &blk_uuid, NULL))
++				continue;
++
++			sprintf(filepath, "/usr/lib/udev/%s", blk_uuid);
++			fp = fopen(filepath, "r");
++			if (fp == NULL) {
++				printf("haven't make-bcache before, no offset file\n");
++				continue;
++			} else {
++				if (fgets(offset, sizeof(offset), fp) == NULL) {
++					printf("can't get offset from %s\n", filepath);
++					fclose(fp);
++					continue;
++				}
++				sb_offset = atoi(offset);
++				fclose(fp);
++			}
++		} else {
++			if (!blkid_do_probe(pr)) {
++				continue;
++			}
++			sb_offset = 0;
  		}
  
 -		if (pread(fd, &sb, sizeof(sb), SB_START) != sizeof(sb))
-+		ret = read_bch_sb(argv[i], fd, &sb, keep_fs);
-+		if (ret != 0)
++		if (pread(fd, &sb, sizeof(sb), (sb_offset + BCH_SB_FILE_VERIFY_SIZE)) != sizeof(sb))
  			continue;
  
  		if (memcmp(sb.magic, bcache_magic, 16))
-@@ -74,14 +94,19 @@ int main(int argc, char **argv)
+@@ -74,14 +119,19 @@ int main(int argc, char **argv)
  
  		uuid_unparse(sb.uuid, uuid);
  
