@@ -1,20 +1,20 @@
-From 8a1ee47ab8422f723459ebcae57476b7b6f22a76 Mon Sep 17 00:00:00 2001
+From 2f55eb9ae7706374c3aac98832f88443a8f67d44 Mon Sep 17 00:00:00 2001
 From: root <root@localhost.localdomain>
-Date: Wed, 21 Jul 2021 19:53:09 +0800
-Subject: [PATCH] bcache-tools: add-a-feature-for-make-bcache-within-filesystem
+Date: Wed, 8 Sep 2021 09:59:33 +0800
+Subject: [PATCH] bcache tools add a feature for make bcache within filesystem
 
 ---
  69-bcache.rules        |   7 +-
  Makefile               |  34 +++--
- bcache-register.c      |  44 ++++--
- bcache-super-show.c    |  44 ++++--
+ bcache-register.c      |  44 +++++--
+ bcache-super-show.c    |  44 +++++--
  bcache.h               |   5 +
- fs.c                   | 314 +++++++++++++++++++++++++++++++++++++++++
- fs.h                   |  36 +++++
- get-bcache-super-block | 159 +++++++++++++++++++++
- make.c                 |  98 ++++++++-----
- probe-bcache.c         |  72 ++++++++--
- 10 files changed, 738 insertions(+), 75 deletions(-)
+ fs.c                   | 337 +++++++++++++++++++++++++++++++++++++++++++++++++
+ fs.h                   |  36 ++++++
+ get-bcache-super-block | 159 +++++++++++++++++++++++
+ make.c                 |  98 +++++++++-----
+ probe-bcache.c         |  72 +++++++++--
+ 10 files changed, 761 insertions(+), 75 deletions(-)
  create mode 100644 fs.c
  create mode 100644 fs.h
  create mode 100644 get-bcache-super-block
@@ -312,10 +312,10 @@ index c83f838..54b6cfb 100644
  #define SB_JOURNAL_BUCKETS	256U
 diff --git a/fs.c b/fs.c
 new file mode 100644
-index 0000000..2a3882c
+index 0000000..b81de25
 --- /dev/null
 +++ b/fs.c
-@@ -0,0 +1,314 @@
+@@ -0,0 +1,337 @@
 +/*
 + * fs feature - bcache super block in fs super block operations
 + *
@@ -494,6 +494,26 @@ index 0000000..2a3882c
 +	}
 +}
 +
++static bool is_valid_dev_name(const char *dev)
++{
++	const char unsafe_str[] = {'|', ';', '&', '$', '>', '<', '`', '\\', '!', '\n', '\0'};
++	const char *dev_name = dev;
++	const char *step;
++
++	while (*dev_name != '\0') {
++		step = unsafe_str;
++		while (*step != '\0') {
++			if (*dev_name == *step) {
++				return false;
++			}
++			step++;
++		}
++		dev_name++;
++	}
++
++	return true;
++}
++
 +static FILE *run_get_off_len_cmd(const char *dev, bool init_sb_file)
 +{
 +	FILE *fstream = NULL;
@@ -504,6 +524,9 @@ index 0000000..2a3882c
 +		mk_bch = BCH_SB_FILE_CREATE;
 +	else
 +		mk_bch = "not_" BCH_SB_FILE_CREATE;
++
++	if (!is_valid_dev_name(dev))
++		return NULL;
 +
 +	snprintf(cmd, TMP_BUF_SIZE, "%s %s %s%s %s %u %s", BCH_SB_FILE_SH, dev,
 +			BCH_SB_FILE_DIR, dev, BCH_SB_FILE_NAME, BCH_SB_FILE_SIZE, mk_bch);
