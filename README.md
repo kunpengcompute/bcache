@@ -11,6 +11,9 @@ CentOS 7.6 for aarch64
 ## 模块说明
 该分支主要用于CentOS7.6操作系统（aarch64）编译得到Bcache驱动模块
 
+## License
+https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/LICENSES
+
 ## 使用说明
 用户指南链接
 https://www.hikunpeng.com/document/detail/zh/kunpengsdss/appAccelFeatures/smartwc/kunpengswc_20_0006.html
